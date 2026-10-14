@@ -182,9 +182,9 @@ apply_docker() {
   local tag; tag="dev-$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo local)"
 
   section 'docker — build the images'
-  docker build --tag "ghcr.io/ryanlan-new/joi-button/web:$tag" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT" >&2 \
+  docker build --tag "ghcr.io/tpmoonchefryan/joi-button/web:$tag" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT" >&2 \
     || die 'web image build failed'
-  docker build --tag "ghcr.io/ryanlan-new/joi-button/api:$tag" -f "$REPO_ROOT/Dockerfile.api" "$REPO_ROOT" >&2 \
+  docker build --tag "ghcr.io/tpmoonchefryan/joi-button/api:$tag" -f "$REPO_ROOT/Dockerfile.api" "$REPO_ROOT" >&2 \
     || die 'api image build failed'
 
   section 'docker — write compose env and the runtime secret'

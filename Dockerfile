@@ -2,7 +2,7 @@
 #
 # Build (what the first verification path does):
 #   docker buildx build --platform linux/amd64 \
-#     -t ghcr.io/ryanlan-new/joi-button/web:replace-me .
+#     -t ghcr.io/tpmoonchefryan/joi-button/web:replace-me .
 #
 # --platform=$BUILDPLATFORM on the builder stage keeps the JS toolchain native
 # to the build host (no QEMU for npm/webpack, which is where all the time goes)
@@ -107,7 +107,7 @@ RUN npm run build \
 FROM nginxinc/nginx-unprivileged:1.28-alpine
 
 LABEL org.opencontainers.image.title="joi-button web" \
-      org.opencontainers.image.source="https://github.com/ryanlan-new/joi-button" \
+      org.opencontainers.image.source="https://github.com/tpmoonchefryan/joi-button" \
       org.opencontainers.image.description="Static Vue 2 SPA served by unprivileged nginx on 8080"
 
 # Full main config (see the header of deploy/nginx.conf for why it is

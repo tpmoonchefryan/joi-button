@@ -19,8 +19,8 @@
 name: joi-button
 
 x-images:
-  api: &api-image "ghcr.io/ryanlan-new/joi-button/api:${IMAGE_TAG:?set IMAGE_TAG in .env}"
-  web: &web-image "ghcr.io/ryanlan-new/joi-button/web:${IMAGE_TAG:?set IMAGE_TAG in .env}"
+  api: &api-image "ghcr.io/tpmoonchefryan/joi-button/api:${IMAGE_TAG:?set IMAGE_TAG in .env}"
+  web: &web-image "ghcr.io/tpmoonchefryan/joi-button/web:${IMAGE_TAG:?set IMAGE_TAG in .env}"
 
 volumes:
   joi-data:        # the shared volume: api writes it, web reads it

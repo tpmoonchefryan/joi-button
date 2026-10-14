@@ -33,8 +33,20 @@ that is *not* `index.html`.
 
 ## Image delivery
 
-Image name: `ghcr.io/ryanlan-new/joi-button/web`, tag placeholder `replace-me`
-(one occurrence, in `web-deployment.yaml`). `imagePullPolicy` is `IfNotPresent`.
+Image names: `ghcr.io/tpmoonchefryan/joi-button/web` and
+`ghcr.io/tpmoonchefryan/joi-button/api`, tag placeholder `replace-me` (the web
+image in `web-deployment.yaml`, the API image in `api-deployment.yaml` and
+`backup-cronjob.yaml`). `imagePullPolicy` is `IfNotPresent`.
+
+`IMAGE_REPO` and `API_IMAGE_REPO` override the two repositories. **A value you
+export wins over the same key in `deploy/deploy.env`**; the file only fills
+gaps. That holds for `IMAGE_REPO`, `API_IMAGE_REPO`, `TAG`, `IMAGE_SOURCE`,
+`NAMESPACE`, `KUBECTL`, `RUNTIME_ENV_FILE`, `MANIFEST_DIR` and
+`ROLLOUT_TIMEOUT`, as it already did for `REMOTE`, `APP_HOST` and `LB_ADDRESS`.
+An exported empty value counts as not set, so it cannot blank out the file's
+value. To deploy an image published under another repository (rolling back to a
+release that predates a repository move, say), export both repositories for that
+one run.
 
 **`deploy/deploy-k3s.sh` is the supported path and the single tag authority.** It
 builds, smoke-tests, streams the image into the node's containerd, applies the
@@ -58,24 +70,59 @@ There are **two tag namespaces, deliberately kept apart**:
 They must not collide. A locally built image carries the bytes of your working
 tree; if it were tagged with the bare sha, `IfNotPresent` would let it shadow the
 CI image for that commit on the node indefinitely, with nothing to reveal the
-substitution. To deploy a CI-published image, name it explicitly:
+substitution. To deploy a CI-published image, take the registry path and name the
+tag explicitly:
 
 ```bash
-ALLOW_REGISTRY_PULL=1 TAG=<short7-sha> deploy/deploy-k3s.sh apply
+IMAGE_SOURCE=registry TAG=<short7-sha> deploy/deploy-k3s.sh apply
 ```
 
-`ALLOW_REGISTRY_PULL` is required because the script otherwise refuses to apply a
-tag that is not already on the node — with `IfNotPresent`, that would replace a
-serving Deployment with one stuck in `ImagePullBackOff`.
+A release does this by itself. Pushing a `vX.Y.Z` tag also publishes both images
+under that tag, and the workflow's `deploy-to-prod` job then runs this script on
+the node with `IMAGE_SOURCE=registry`, `TAG=vX.Y.Z`, and `IMAGE_REPO` and
+`API_IMAGE_REPO` set to the repositories that same run pushed to. A renamed or
+moved repository therefore no longer leaves the deploy pulling an image that
+does not exist, and the node's `deploy/deploy.env` cannot point it at another
+repository.
+
+**The registry path pulls both images on the node before it applies
+anything.** Before the first `kubectl apply` (namespace, runtime Secret,
+workloads) it runs `PULL_CMD` on the node for the API image, then for the web
+image. If either pull fails, the script refuses and exits without changing any
+object, and whatever is running keeps serving. Without this, a tag the node
+cannot pull would take the API down: its Deployment is `Recreate`, so the old
+pod stops before the new one is found stuck in `ImagePullBackOff`. With both
+images already on the node, the `Recreate` gap is only the new pod's start-up.
+
+| Variable   | Default                   | Purpose                                                               |
+| ---------- | ------------------------- | --------------------------------------------------------------------- |
+| `PREPULL`  | `1`                       | `0` skips the pre-pull, with a WARNING, and with it the refusal above |
+| `PULL_CMD` | `sudo -n k3s crictl pull` | the command that pulls one image on the node; the image reference is appended |
+
+The default `PULL_CMD` needs passwordless sudo on the node, as the default
+`KUBECTL` does. On a node driven through a kubeconfig (`KUBECTL=kubectl` in its
+`deploy/deploy.env`) that default may fail, and the first deploy then refuses
+before applying anything: set `PULL_CMD` in that node's `deploy/deploy.env`, or
+pass `PREPULL=0` for one run.
+
+`ALLOW_REGISTRY_PULL=1` belongs to the local-build path. Without it, that path
+refuses to apply a tag that is not already on the node — with `IfNotPresent`,
+that would replace a serving Deployment with one stuck in `ImagePullBackOff`.
+With it, the script proceeds and leaves the pull to the kubelet; for a
+CI-published image, prefer the registry path above, which checks the pull
+before applying.
 
 **GHCR packages are private by default, even for a public repository.** The
-`org.opencontainers.image.source` label in the Dockerfile makes the package
+`org.opencontainers.image.source` label in both Dockerfiles makes each package
 auto-link to this repo, which enables "inherit access from source repository" —
-but that is a one-time manual toggle in the package settings that nobody has
-performed yet. Until it is done (or an `imagePullSecret` is added to the
-namespace and referenced in the pod spec), the only working delivery path is the
-local import above. **Record here which one was chosen**, so the next operator
-does not rediscover it from a 401.
+but that, and making a package public, are manual settings on the package. The
+registry path, and with it the release deploy above, assumes the node can pull
+both packages anonymously: no `imagePullSecret` is shipped. If either package
+cannot be pulled that way, the pre-pull fails and the script refuses before
+applying anything; the local import above does not depend on package
+visibility. **Record here how the node gets its images** (public packages, an
+`imagePullSecret`, or the local import), so the next operator does not
+rediscover it from a 401.
 
 Use a fresh tag per build. Re-importing new content under a tag containerd
 already has, with `IfNotPresent`, leaves the old layers serving unless you also
@@ -88,9 +135,9 @@ The manual equivalent of the import step:
 ```bash
 TAG="dev-$(git rev-parse --short=7 HEAD)"
 docker buildx build --platform linux/amd64 --provenance=false \
-  -t "ghcr.io/ryanlan-new/joi-button/web:${TAG}" --build-arg PUBLIC_PATH=/ --load .
-deploy/smoke-image.sh "ghcr.io/ryanlan-new/joi-button/web:${TAG}"
-docker save "ghcr.io/ryanlan-new/joi-button/web:${TAG}" \
+  -t "ghcr.io/tpmoonchefryan/joi-button/web:${TAG}" --build-arg PUBLIC_PATH=/ --load .
+deploy/smoke-image.sh "ghcr.io/tpmoonchefryan/joi-button/web:${TAG}"
+docker save "ghcr.io/tpmoonchefryan/joi-button/web:${TAG}" \
   | ssh "$REMOTE" 'sudo k3s ctr images import -'
 ```
 
