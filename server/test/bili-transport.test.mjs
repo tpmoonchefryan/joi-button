@@ -41,6 +41,7 @@ import {
   INTERACTION_END_CMD,
   OPERATION,
   OPEN_LIVE_PATHS,
+  OpenPlatformError,
   PROTO_VERSION,
   SIGNATURE_METHOD,
   SIGNATURE_VERSION,
@@ -1760,6 +1761,153 @@ test('a dial that was stopped does not reach into the session a later start open
     rig.connections[0].send(danmakuPacket({ openId: 'open-live', uname: 'Live', msg: 'JOI-LIVE' }))
     await until(() => heard.length === 1, 'a danmaku on the live socket')
   } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// a stop() that lands while /v2/app/start is answering (JOI-BUTTON-STORY-121)
+//
+// The stop runs while the platform is still opening the session, so there is
+// no `session` yet and it ends nothing; the session the answer opens a moment
+// later belongs to a start nobody is waiting for any more. In production that
+// is a deploy: SIGTERM stops the source while a visitor's start is in flight.
+// Dialling that session would leave a socket listening for nobody until the
+// platform reaps it for want of a project heartbeat, or until the next
+// visitor's start ends it and walks into the 7001 cooldown. The lifecycle
+// cannot close it either: the stop has already settled its race, so its
+// clean-up for a start that turns ready late never runs.
+
+test('a stop() that lands while /v2/app/start is answering ends the session that answer opened, never dials it, and holds nothing against the next start', async () => {
+  let answer
+  const answerHeld = new Promise((resolve) => {
+    answer = resolve
+  })
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: async (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      if (starts === 1) await answerHeld
+      return startAnswer(wssUrl, { gameId: `game-000${starts}` })
+    },
+  })
+  const dials = []
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {}, onDial: (record) => dials.push(record) }
+  try {
+    const outcome = rig.transport.start(handlers).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
+    await rig.transport.stop()
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 0, 'stop() ended a session the platform had not opened yet')
+    answer()
+
+    const err = await outcome
+    assert.ok(err instanceof OpenPlatformError, 'a start that a stop overtook went on to dial as if someone still held it')
+    assert.match(err.message, /stopped before \/v2\/app\/start had answered/)
+    assert.match(err.message, /not dialling/)
+    assert.notEqual(err.retryable, true, 'a start nobody is waiting for asked to be retried')
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end],
+      'the session that answer opened was left running on the platform',
+    )
+    assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.end)[0].body, {
+      app_id: CREDENTIALS.appId,
+      game_id: 'game-0001',
+    })
+    assert.equal(rig.connections.length, 0, 'a session nobody holds was dialled')
+    assert.deepEqual(dials, [], 'a start that never dialled reported a dial')
+    const state = rig.transport.state()
+    assert.equal(state.hasSession, false, 'the cancelled start kept its session')
+    // Cancelled by a stop, so it says nothing about the room: not counted, and
+    // no backoff for the next visitor to run into.
+    assert.equal(state.consecutiveStartFailures, 0)
+    assert.equal(state.nextDialInMs, 0)
+
+    // The clock is NOT moved: had the cancellation armed the backoff, the gate
+    // would refuse this start outright.
+    await rig.transport.start(handlers)
+    assert.equal(rig.transport.state().authenticated, true)
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end, OPEN_LIVE_PATHS.start],
+    )
+    assert.equal(dials.length, 1)
+    assert.equal(dials[0].outcome, 'ok')
+    assert.equal(dials[0].attempt, 1, 'the cancelled start was counted as a failed dial')
+  } finally {
+    answer()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test("a stop() that lands while /v2/app/start is answering for a held session's replacement ends that replacement too, and never dials it", async () => {
+  const stalled = await startStalledServer()
+  let answer
+  const answerHeld = new Promise((resolve) => {
+    answer = resolve
+  })
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: async (call, wssUrl) => {
+      if (call.path === OPEN_LIVE_PATHS.start) {
+        starts += 1
+        if (starts === 2) await answerHeld
+        return startAnswer([stalled.url, wssUrl], { gameId: `game-000${starts}` })
+      }
+      if (call.path === OPEN_LIVE_PATHS.heartbeat) return { status: 200, json: { code: 7003, message: 'closed' } }
+      return null
+    },
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+  try {
+    await assert.rejects(() => rig.transport.start(handlers), (err) => err.retryable === true)
+    rig.clock.advance(1_250) // what the lifecycle waits before it redials
+    const outcome = rig.transport.start(handlers).then(
+      () => null,
+      (err) => err,
+    )
+    // The held session has been heartbeated (7003) and ended by the time this
+    // arrives: the second /v2/app/start is only sent once that end answered.
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 2, 'the second /v2/app/start request')
+    await rig.transport.stop()
+    answer()
+
+    const err = await outcome
+    assert.ok(err instanceof OpenPlatformError, 'the replacement session was dialled after the stop')
+    assert.match(err.message, /stopped before \/v2\/app\/start had answered/)
+    assert.match(err.message, /not dialling/)
+    assert.notEqual(err.retryable, true, 'a start nobody is waiting for asked to be retried')
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [
+        OPEN_LIVE_PATHS.start,
+        OPEN_LIVE_PATHS.heartbeat,
+        OPEN_LIVE_PATHS.end,
+        OPEN_LIVE_PATHS.start,
+        OPEN_LIVE_PATHS.end,
+      ],
+      'the replacement session was left running on the platform',
+    )
+    assert.deepEqual(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.end).map((call) => call.body),
+      [
+        { app_id: CREDENTIALS.appId, game_id: 'game-0001' },
+        { app_id: CREDENTIALS.appId, game_id: 'game-0002' },
+      ],
+    )
+    assert.equal(stalled.upgrades(), 1)
+    assert.equal(rig.connections.length, 0, 'the replacement session was dialled')
+    assert.equal(rig.transport.state().hasSession, false, 'the cancelled start kept its session')
+  } finally {
+    answer()
     await rig.transport.stop().catch(() => {})
     await rig.close()
     await stalled.close()

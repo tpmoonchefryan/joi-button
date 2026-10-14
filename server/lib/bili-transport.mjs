@@ -132,6 +132,11 @@
 //     and "does not reach into the session a later start opened" cases go red.
 //     Nobody is waiting for that dial any more; acting on its timeout would
 //     retry for nobody, or deafen the visitor who came next.
+//   * Drop the stop check right after startGameSession() in start() — the two
+//     "stop() that lands while /v2/app/start is answering" cases go red: the
+//     session that answer opens is dialled and left running for nobody. The
+//     stop found nothing to end, so that start is the only side that can end
+//     it (JOI-BUTTON-STORY-121).
 //   * Make the backoff a constant instead of a doubling, or let a start dial
 //     while backing off — the backoff case goes red on the recorded delays and
 //     on the gateway's call count respectively.
@@ -1339,6 +1344,22 @@ export function createBiliTransport(config = {}) {
       let target = reused
       if (target === null) {
         target = await startGameSession(owner)
+        if (stopCount !== stopsAtEntry) {
+          // A stop() landed before /v2/app/start answered — while it was
+          // answering, in practice (or, rarer, while the previous session was
+          // being ended above). Whatever session that stop found, it ended;
+          // the one this answer opened did not exist yet, so it is the one
+          // this start holds (startGameSession made it `session`, owned by
+          // `owner`), and nobody is waiting for it. Dialling it would listen
+          // on a session nobody holds until the platform reaps it for want of
+          // a project heartbeat, or until the next visitor's start ends it and
+          // walks into the 7001 cooldown. Thrown inside the try, so the
+          // failure path below ends it: stopped, so not counted, no backoff,
+          // never retryable, nothing kept.
+          throw new OpenPlatformError(
+            'bili transport: stopped before /v2/app/start had answered — ending the new app session, not dialling',
+          )
+        }
         session = target
         sessionOwner = owner
 
