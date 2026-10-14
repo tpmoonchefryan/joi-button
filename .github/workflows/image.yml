@@ -263,21 +263,26 @@ jobs:
           {
             echo "### Container images published (web + api)"
             echo
-            echo "Deploy this exact PAIR with the repository's own entrypoint —"
-            echo "\`TAG=\` is required, because the script's own default (\`dev-<sha>\`)"
-            echo "names LOCALLY built images, not these. One tag pins both, and"
-            echo "\`IMAGE_REPO\`/\`API_IMAGE_REPO\` name the repositories this run pushed to:"
+            echo "Deploy this exact PAIR with the repository's own entrypoint, run on the"
+            echo "node or from a machine whose \`REMOTE\` names it. \`IMAGE_SOURCE=registry\`"
+            echo "pulls both images on the node before anything is applied, and refuses"
+            echo "without changing anything if either pull fails."
+            echo "\`TAG=\` pins this run's images rather than whatever commit the checkout is"
+            echo "on; one tag pins both, and \`IMAGE_REPO\`/\`API_IMAGE_REPO\` name the"
+            echo "repositories this run pushed to:"
             echo
             echo '```bash'
-            echo "ALLOW_REGISTRY_PULL=1 IMAGE_REPO=${IMAGE} API_IMAGE_REPO=${API_IMAGE} TAG=${SHORT_SHA} deploy/deploy-k3s.sh apply"
+            echo "IMAGE_SOURCE=registry IMAGE_REPO=${IMAGE} API_IMAGE_REPO=${API_IMAGE} TAG=${SHORT_SHA} deploy/deploy-k3s.sh apply"
             echo '```'
             echo
-            echo "Or paste them into the k8s Deployments over the \`replace-me\` placeholders:"
+            echo "Or paste them into the manifests over the \`replace-me\` placeholders. The"
+            echo "API image goes in twice: the API Deployment, and the backup CronJob, which"
+            echo "runs the API image too. Nothing is pulled ahead of the apply on this path:"
             echo
             echo '```yaml'
-            echo "        # joi-button-web"
+            echo "        # joi-button-web (web-deployment.yaml)"
             echo "        image: ${PRIMARY}"
-            echo "        # joi-button-api"
+            echo "        # joi-button-api (api-deployment.yaml) and the backup CronJob (backup-cronjob.yaml)"
             echo "        image: ${API_PRIMARY}"
             echo '```'
             echo

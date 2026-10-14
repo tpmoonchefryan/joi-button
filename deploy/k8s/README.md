@@ -40,9 +40,11 @@ image in `web-deployment.yaml`, the API image in `api-deployment.yaml` and
 
 `IMAGE_REPO` and `API_IMAGE_REPO` override the two repositories. **A value you
 export wins over the same key in `deploy/deploy.env`**; the file only fills
-gaps. That holds for `IMAGE_REPO`, `API_IMAGE_REPO`, `TAG`, `IMAGE_SOURCE`,
-`NAMESPACE`, `KUBECTL`, `RUNTIME_ENV_FILE`, `MANIFEST_DIR` and
-`ROLLOUT_TIMEOUT`, as it already did for `REMOTE`, `APP_HOST` and `LB_ADDRESS`.
+gaps. That holds for every name the script's header documents, which are the
+names in its `CALLER_WINS` list: `REMOTE`, `APP_HOST`, `LB_ADDRESS`,
+`IMAGE_REPO`, `API_IMAGE_REPO`, `IMAGE_SOURCE`, `TAG`, `NAMESPACE`, `KUBECTL`,
+`RUNTIME_ENV_FILE`, `MANIFEST_DIR`, `ROLLOUT_TIMEOUT`, `RESTART_IF_UNCHANGED`,
+`SMOKE`, `ALLOW_REGISTRY_PULL`, `PREPULL`, `PULL_CMD` and `ENV_FILE`.
 An exported empty value counts as not set, so it cannot blank out the file's
 value. To deploy an image published under another repository (rolling back to a
 release that predates a repository move, say), export both repositories for that
@@ -108,9 +110,9 @@ pass `PREPULL=0` for one run.
 `ALLOW_REGISTRY_PULL=1` belongs to the local-build path. Without it, that path
 refuses to apply a tag that is not already on the node — with `IfNotPresent`,
 that would replace a serving Deployment with one stuck in `ImagePullBackOff`.
-With it, the script proceeds and leaves the pull to the kubelet; for a
-CI-published image, prefer the registry path above, which checks the pull
-before applying.
+With it, the script proceeds without any pre-pull and leaves the pull to the
+kubelet. It is not a way to deploy a CI-published image: that takes the
+registry path above, which checks the pull before applying.
 
 **GHCR packages are private by default, even for a public repository.** The
 `org.opencontainers.image.source` label in both Dockerfiles makes each package

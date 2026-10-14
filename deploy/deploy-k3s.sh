@@ -54,7 +54,8 @@
 #     ROLLOUT_TIMEOUT        default 120s
 #     RESTART_IF_UNCHANGED   default 1                            (see the note below)
 #     SMOKE                  default 1     run deploy/smoke-image.sh before shipping
-#     ALLOW_REGISTRY_PULL    default 0     permit applying a tag absent from the node
+#     ALLOW_REGISTRY_PULL    default 0     local-build path: permit applying a tag absent
+#                                          from the node (no pre-pull; see TAGS below)
 #     PREPULL                default 1     registry path: pull both images on the node
 #                                          before applying anything (see the note below)
 #     PULL_CMD               default "sudo -n k3s crictl pull"    (see the note below)
@@ -63,8 +64,13 @@
 #   TAGS: this script builds and deploys `dev-<short7-sha>` (plus `-dirty` when the
 #   working tree is not clean). CI publishes bare `<short7-sha>` to GHCR. The two
 #   namespaces are separate on purpose — see the comment at the TAG default — so
-#   deploying a CI image means naming it:
-#     ALLOW_REGISTRY_PULL=1 TAG=<short7-sha> deploy/deploy-k3s.sh apply
+#   deploying a CI image means naming it, on the registry path:
+#     IMAGE_SOURCE=registry TAG=<short7-sha> deploy/deploy-k3s.sh apply
+#   That works on the node (REMOTE empty) and from a machine whose REMOTE names the
+#   node, and in both cases it pulls the two images on the node before it applies
+#   anything (see PREPULL below). ALLOW_REGISTRY_PULL=1 belongs to the local-build
+#   path only: it lets that path apply a tag the node does not have and leaves the
+#   pull to the kubelet, so it never goes through the pre-pull.
 #
 #   ASSUMPTION, stated so it can be checked rather than believed: a stock k3s node has
 #   no standalone kubectl binary -- kubectl is reached as a k3s subcommand, and reading
@@ -170,8 +176,8 @@ RESTART_IF_UNCHANGED="${RESTART_IF_UNCHANGED:-1}"
 # Where the images come from:
 #   local      build them here and stream into the node's containerd over ssh
 #              (the original two-machine model; needs REMOTE + Docker here).
-#   registry   they were built and pushed to a registry (GHCR) by CI; the node's
-#              kubelet pulls them. No Docker, no build, no import — and this is
+#   registry   they were built and pushed to a registry (GHCR) by CI; `apply` pulls
+#              them on the node first (PREPULL). No Docker, no build, no import — and this is
 #              what makes a SINGLE-HOST deploy (bootstrap run ON the node, REMOTE
 #              empty) possible, because nothing here needs a builder anymore.
 IMAGE_SOURCE="${IMAGE_SOURCE:-local}"
@@ -241,7 +247,7 @@ missing_config() {
 }
 # REMOTE is REQUIRED for the local-build path (it names the node to stream the
 # image into over ssh) but OPTIONAL for the registry path (the node is this
-# machine, and the kubelet pulls the image itself). An empty REMOTE therefore
+# machine, and it pulls the images itself). An empty REMOTE therefore
 # only makes sense with IMAGE_SOURCE=registry; anything else is a misconfiguration
 # that would otherwise fail deep inside a build with a confusing message.
 if [[ -z "${REMOTE}" && "${IMAGE_SOURCE}" != "registry" ]]; then
@@ -310,10 +316,10 @@ log "kubectl:    ${KUBECTL}"
 
 do_import() {
   # Registry path: nothing to build or stream. CI already published both images
-  # and the node's kubelet pulls them. Skipping here is what lets a single-host
-  # run (no Docker on the node) reach `apply`.
+  # and `apply` pulls them on the node before it applies anything (prepull_images).
+  # Skipping here is what lets a single-host run (no Docker on the node) reach `apply`.
   if [[ "${IMAGE_SOURCE}" == "registry" ]]; then
-    log "IMAGE_SOURCE=registry: skipping build/import; the kubelet pulls ${IMAGE_REF} and ${API_IMAGE_REF} from the registry."
+    log "IMAGE_SOURCE=registry: skipping build/import; apply first pulls ${API_IMAGE_REF} and ${IMAGE_REF} on the node, and applies nothing if either pull fails."
     return 0
   fi
 
@@ -602,7 +608,7 @@ do_apply() {
         if [[ "${ALLOW_REGISTRY_PULL:-0}" == "1" ]]; then
           warn "${ref} is not on ${where}; proceeding because ALLOW_REGISTRY_PULL=1. The kubelet must be able to pull it (public package or an imagePullSecret)."
         else
-          fail "${ref} is not in ${where}'s image store, and the running Deployment would be replaced by one that cannot start. Either run 'deploy/deploy-k3s.sh import' to build and stream this tag in, or re-run with IMAGE_SOURCE=registry (or ALLOW_REGISTRY_PULL=1) if the kubelet is meant to pull it from the registry."
+          fail "${ref} is not in ${where}'s image store, and the running Deployment would be replaced by one that cannot start. Either run 'deploy/deploy-k3s.sh import' to build and stream this tag in, or re-run with IMAGE_SOURCE=registry to pull both images on ${where} before anything is applied. ALLOW_REGISTRY_PULL=1 also gets past this check, but without that pre-pull: it leaves the pull to the kubelet, after the running Deployment has been replaced."
         fi
       fi
     done

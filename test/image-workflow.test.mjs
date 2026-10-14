@@ -442,6 +442,20 @@ test("the job summary's manual deploy command names the repositories this run pu
     assert.ok(assigns(command, 'API_IMAGE_REPO', API), command)
     assert.ok(assigns(command, 'TAG', SHORT_SHA), command)
     assert.ok(command.endsWith('deploy/deploy-k3s.sh apply'), command)
+    // STORY-119 SUB-011: the registry path, which pulls both images on the node
+    // before it applies anything. ALLOW_REGISTRY_PULL=1 is the local-build
+    // path's switch, and that path never pre-pulls.
+    assert.ok(assigns(command, 'IMAGE_SOURCE', 'registry'), command)
+    assert.doesNotMatch(command, /ALLOW_REGISTRY_PULL/, command)
+    // The paste-into-the-manifests alternative: the API image also goes into the
+    // backup CronJob, and the line that says so carries the API image.
+    const summary = readFileSync(summaryFile, 'utf8')
+    const yaml = /```yaml\n([^]*?)\n```/.exec(summary)
+    assert.ok(yaml, 'the summary carries a yaml block')
+    const lines = yaml[1].split('\n').map((line) => line.trim())
+    const cronJob = lines.findIndex((line) => line.includes('backup-cronjob.yaml'))
+    assert.ok(cronJob >= 0, `the yaml block does not mention backup-cronjob.yaml:\n${yaml[1]}`)
+    assert.equal(lines[cronJob + 1], `image: ${API}:${SHORT_SHA}`, yaml[1])
   } finally {
     box.dispose()
   }

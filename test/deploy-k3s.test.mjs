@@ -654,3 +654,42 @@ test('STORY-119 SUB-008: IMAGE_SOURCE=local keeps the node image-store check and
   assert.deepEqual(missing.applied, [])
   assertNoOutsideParty(missing)
 })
+
+// ---------------------------------------------------------------------------
+// SUB-011: one recipe for a CI image, and the documentation says what the script does
+// ---------------------------------------------------------------------------
+
+// The registry recipe deploy/k8s/README.md gives for a CI-published image.
+const CI_IMAGE_RECIPE = 'IMAGE_SOURCE=registry TAG=<short7-sha> deploy/deploy-k3s.sh apply'
+
+test('STORY-119 SUB-011: --help gives the README\'s registry recipe for a CI image, and its TAGS section offers no ALLOW_REGISTRY_PULL=1 TAG=', (t) => {
+  const run = runDeploy(t, { mode: '--help' })
+  assert.equal(run.status, 0, run.describe())
+  assert.deepEqual(run.events, [], 'help reached a stub')
+  // The TAGS section of the help: its heading line up to the first blank line.
+  const tags = /^ *TAGS:[^]*?(?=\n[ \t]*\n)/m.exec(run.stdout)?.[0]
+  assert.ok(tags, `the help has no TAGS section:\n${run.stdout}`)
+  const recipes = tags.split('\n').map((line) => line.trim()).filter((line) => line.endsWith('deploy/deploy-k3s.sh apply'))
+  assert.deepEqual(recipes, [CI_IMAGE_RECIPE], tags)
+  assert.doesNotMatch(tags, /ALLOW_REGISTRY_PULL=1 TAG=/)
+  const prose = tags.replace(/\s+/g, ' ')
+  assert.match(prose, /ALLOW_REGISTRY_PULL=1 belongs to the local-build path only/)
+  assert.match(prose, /never goes through the pre-pull/)
+  // Word for word what deploy/k8s/README.md gives.
+  const readme = readFileSync(join(MANIFEST_DIR, 'README.md'), 'utf8').split('\n')
+  assert.ok(readme.includes(CI_IMAGE_RECIPE), 'deploy/k8s/README.md no longer gives the same recipe on a line of its own')
+})
+
+test('STORY-119 SUB-011: deploy/k8s/README.md names exactly the CALLER_WINS names as the ones an export wins for', () => {
+  const list = /^CALLER_WINS=\(\n([^)]*)\n\)$/m.exec(readFileSync(SCRIPT, 'utf8'))
+  assert.ok(list, 'CALLER_WINS=( ... ) is no longer a multi-line array in deploy-k3s.sh; update this test')
+  const callerWins = list[1].trim().split(/\s+/)
+  assert.ok(callerWins.includes('PULL_CMD') && callerWins.includes('ENV_FILE'), callerWins.join(' '))
+
+  const readme = readFileSync(join(MANIFEST_DIR, 'README.md'), 'utf8')
+  const sentence = /names in its `CALLER_WINS` list: ([^.]*)\./.exec(readme)
+  assert.ok(sentence, 'deploy/k8s/README.md no longer lists the CALLER_WINS names')
+  const named = [...sentence[1].matchAll(/`([A-Z_]+)`/g)].map((m) => m[1])
+  assert.equal(new Set(named).size, named.length, `a name is listed twice: ${named.join(' ')}`)
+  assert.deepEqual([...named].sort(), [...callerWins].sort())
+})
