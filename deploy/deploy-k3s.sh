@@ -55,6 +55,9 @@
 #     RESTART_IF_UNCHANGED   default 1                            (see the note below)
 #     SMOKE                  default 1     run deploy/smoke-image.sh before shipping
 #     ALLOW_REGISTRY_PULL    default 0     permit applying a tag absent from the node
+#     PREPULL                default 1     registry path: pull both images on the node
+#                                          before applying anything (see the note below)
+#     PULL_CMD               default "sudo -n k3s crictl pull"    (see the note below)
 #     ENV_FILE               default deploy/deploy.env
 #
 #   TAGS: this script builds and deploys `dev-<short7-sha>` (plus `-dirty` when the
@@ -81,6 +84,15 @@
 #   no-op, no pods restart, and "rollout status" would happily report success while the
 #   old bytes keep serving. When the Deployment's generation does not move, this script
 #   therefore issues an explicit "rollout restart". Set RESTART_IF_UNCHANGED=0 to opt out.
+#
+#   PREPULL: with IMAGE_SOURCE=registry, `apply` first pulls the API image and then the
+#   web image ON THE NODE with PULL_CMD, and refuses before it applies anything if either
+#   pull fails. The API Deployment is Recreate, so applying a tag the node cannot pull
+#   would stop the serving pod first and then wait in ImagePullBackOff. PULL_CMD gets the
+#   image reference as its one argument and runs where kubectl runs (over ssh when REMOTE
+#   is set). Its default needs passwordless sudo, like the KUBECTL default; a node driven
+#   with KUBECTL=kubectl and a kubeconfig sets PULL_CMD to whatever pulls into that
+#   node's image store. PREPULL=0 skips the step, with a warning.
 
 set -euo pipefail
 
@@ -121,7 +133,7 @@ CALLER_WINS=(
   REMOTE APP_HOST LB_ADDRESS
   IMAGE_REPO API_IMAGE_REPO IMAGE_SOURCE TAG NAMESPACE KUBECTL
   RUNTIME_ENV_FILE MANIFEST_DIR ROLLOUT_TIMEOUT RESTART_IF_UNCHANGED
-  SMOKE ALLOW_REGISTRY_PULL ENV_FILE
+  SMOKE ALLOW_REGISTRY_PULL PREPULL PULL_CMD ENV_FILE
 )
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/deploy.env}"
 if [[ -f "${ENV_FILE}" ]]; then
@@ -163,6 +175,10 @@ RESTART_IF_UNCHANGED="${RESTART_IF_UNCHANGED:-1}"
 #              what makes a SINGLE-HOST deploy (bootstrap run ON the node, REMOTE
 #              empty) possible, because nothing here needs a builder anymore.
 IMAGE_SOURCE="${IMAGE_SOURCE:-local}"
+# Registry path only: pull both images on the node before applying anything.
+# See the PREPULL note in the header and prepull_images below.
+PREPULL="${PREPULL:-1}"
+PULL_CMD="${PULL_CMD:-sudo -n k3s crictl pull}"
 
 MODE="${1:-all}"
 
@@ -525,6 +541,25 @@ Install Node.js on this node, or remove the ' # ...' from those lines, then re-r
     "${KUBECTL} -n '${NAMESPACE}' create secret generic '${SECRET_NAME}' --from-env-file=/dev/stdin --dry-run=client -o yaml | ${KUBECTL} apply -f -"
 }
 
+# Registry path: pull both images ON THE NODE before anything is applied, the API
+# image first (its Deployment is the Recreate one). A failure stops the run here,
+# while the running workloads are still untouched. See the note in do_apply.
+prepull_images() {
+  local where="$1" ref
+  if [[ "${PREPULL}" == "0" ]]; then
+    warn "PREPULL=0: not pulling ${API_IMAGE_REF} and ${IMAGE_REF} on ${where} before applying. If either cannot be pulled, the API's Recreate rollout stops the running pod first and then waits in ImagePullBackOff."
+    return 0
+  fi
+  for ref in "${API_IMAGE_REF}" "${IMAGE_REF}"; do
+    log "Pre-pulling ${ref} on ${where} (${PULL_CMD}) ..."
+    # The reference is single-quoted where it lands in the node's command line, so
+    # the node's shell re-expands nothing (the same convention as the ctr checks).
+    node_exec "${PULL_CMD} '${ref}'" ||
+      fail "could not pull ${ref} on ${where}. Nothing was applied; the running workloads are untouched. Check that this repository and tag exist, and that the node may read them: the package must be public, or the node needs pull credentials for the registry. If it is the pull command that does not work on this node, set PULL_CMD (it gets the image reference as its one argument), or PREPULL=0 to skip this check deliberately."
+  done
+  log "Both images are on ${where}; applying."
+}
+
 do_apply() {
   collect_manifests
 
@@ -544,16 +579,20 @@ do_apply() {
 
   # imagePullPolicy is IfNotPresent, so a tag that never reached this node is a
   # rollout that will sit in ImagePullBackOff unless the registry happens to be
-  # reachable AND the package is readable (public, or via an imagePullSecret).
+  # reachable AND the package is readable (public, or via an imagePullSecret). By
+  # then the apply below has already replaced a working Deployment spec — and the
+  # API Deployment is Recreate, so its serving pod is stopped BEFORE the new one
+  # tries to pull. Both paths therefore make sure the images are on the node first.
   #
-  # In the REGISTRY path this is expected: the image is NOT in the node's local
-  # store — the kubelet pulls it on first use — so checking the local store would
-  # always "fail" and is skipped. In the LOCAL-BUILD path the image was just
-  # streamed in, so its absence is a real STOP: the apply below replaces a working
-  # Deployment spec, and proceeding on a tag that resolves nowhere trades a serving
-  # site for ImagePullBackOff.
+  # In the REGISTRY path the images are not expected in the node's store yet, so
+  # the proof is a pull: PULL_CMD fetches them on the node, the API first. A
+  # repository CI does not push to, a tag it never pushed, or a package the node
+  # may not read stops the deploy HERE, before anything is applied. And because the
+  # images are then already present, the Recreate gap shrinks to start-up time.
+  # In the LOCAL-BUILD path the image was just streamed in, so its absence from the
+  # node's store is a real STOP for the same reason.
   if [[ "${IMAGE_SOURCE}" == "registry" ]]; then
-    log "IMAGE_SOURCE=registry: the kubelet pulls ${IMAGE_REF} and ${API_IMAGE_REF} from the registry; not checking the node's local image store."
+    prepull_images "${where}"
   else
     local ref
     for ref in "${IMAGE_REF}" "${API_IMAGE_REF}"; do

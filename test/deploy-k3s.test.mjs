@@ -14,8 +14,11 @@
 //   ssh       a fake `ssh` first on PATH. It never opens a connection and
 //             refuses every host but the fixture alias, which is under the
 //             RFC 2606 `.invalid` TLD and so cannot resolve anywhere.
-//   the rest  sudo, k3s, crictl, ctr, docker and kubectl on PATH are tripwires:
-//             they record that they were reached and fail.
+//   pulls     PULL_CMD is an absolute path to a stub that records the image
+//             reference and fails for the one named in STUB_PULL_FAIL. The fake
+//             `sudo` answers the default PULL_CMD the same way, and nothing else.
+//   the rest  k3s, crictl, ctr, docker and kubectl on PATH are tripwires: they
+//             record that they were reached and fail.
 //
 // ENV_FILE and RUNTIME_ENV_FILE always point at fixtures in a temporary
 // directory. That is not tidiness: a real, git-ignored deploy/deploy.env can sit
@@ -67,11 +70,28 @@ echo "tripwire: the real '$name' must never be reached from test/deploy-k3s.test
 exit 97
 `
 
+// sudo answers exactly one call, the default PULL_CMD (`sudo -n k3s crictl pull
+// <ref>`), as a pull that succeeds unless the ref is STUB_PULL_FAIL. Anything
+// else is a tripwire. The real sudo is never reached.
 const FAKE_SUDO = String.raw`#!/usr/bin/env bash
 ${LOG_FN}
 log_event sudo "$@"
+if [ "$#" = 5 ] && [ "$1" = -n ] && [ "$2" = k3s ] && [ "$3" = crictl ] && [ "$4" = pull ]; then
+  if [ "$5" = "$STUB_PULL_FAIL" ]; then echo "fake crictl: pulling image $5: not found" >&2; exit 1; fi
+  echo "Image is up to date for $5"
+  exit 0
+fi
 echo "tripwire: 'sudo $*' is not a call this test expects; the real sudo is never reached" >&2
 exit 97
+`
+
+// PULL_CMD for most runs: an absolute path, so the pre-pull never needs sudo.
+const FAKE_PULL = String.raw`#!/usr/bin/env bash
+${LOG_FN}
+log_event pull "$@"
+if [ "$#" != 1 ]; then echo "fake pull: expected one image reference, got $#" >&2; exit 2; fi
+if [ "$1" = "$STUB_PULL_FAIL" ]; then echo "fake pull: $1: not found" >&2; exit 1; fi
+echo "Image is up to date for $1"
 `
 
 // The fake ssh. FAKE_SSH_MODE=record (the default) only records, and keeps what
@@ -193,6 +213,7 @@ function sandbox(t) {
     state: join(root, 'state'),
     home: join(root, 'home'),
     kubectl: join(root, 'kubectl-stub'),
+    pull: join(root, 'pull-stub'),
     envFile: join(root, 'deploy.env'),
     runtimeEnv: join(root, 'runtime.env'),
   }
@@ -201,6 +222,7 @@ function sandbox(t) {
   writeExecutable(join(box.bin, 'sudo'), FAKE_SUDO)
   for (const name of ['kubectl', 'k3s', 'crictl', 'ctr', 'docker']) writeExecutable(join(box.bin, name), TRIPWIRE)
   writeExecutable(box.kubectl, FAKE_KUBECTL)
+  writeExecutable(box.pull, FAKE_PULL)
   writeFileSync(box.runtimeEnv, 'JOI_TEST_KEY=fixture-value\n')
   writeFileSync(box.envFile, '')
   return box
@@ -243,6 +265,7 @@ function runDeploy(t, { mode = 'apply', deployEnv = '', env = {} } = {}) {
     ENV_FILE: box.envFile,
     RUNTIME_ENV_FILE: box.runtimeEnv,
     KUBECTL: box.kubectl,
+    PULL_CMD: box.pull,
     IMAGE_SOURCE: 'registry',
     TAG: TEST_TAG,
     ...(typeof env === 'function' ? env(box) : env),
@@ -383,6 +406,7 @@ test('STORY-119 SUB-007: a non-empty export wins over deploy.env for every docum
       `RUNTIME_ENV_FILE=${join(box.root, 'no-such-runtime.env')}`,
       `MANIFEST_DIR=${join(box.root, 'no-such-manifests')}`,
       'ROLLOUT_TIMEOUT=111s',
+      `PULL_CMD=${join(box.root, 'no-such-pull')}`, // the caller's PULL_CMD is the stub
       '',
     ].join('\n')
   const callerSide = (box) => ({
@@ -431,4 +455,94 @@ test('STORY-119 SUB-007: a non-empty export wins over deploy.env for every docum
   assert.equal(empty.status, 0, empty.describe())
   assertPinned(empty, 'file.example.test/joi/web:v0.0.0-caller', 'file.example.test/joi/api:v0.0.0-caller')
   assertNoOutsideParty(empty)
+})
+
+// ---------------------------------------------------------------------------
+// SUB-008: the registry path pulls both images on the node before applying
+// ---------------------------------------------------------------------------
+
+const API_REF = `${API_REPO}:${TEST_TAG}`
+const WEB_REF = `${WEB_REPO}:${TEST_TAG}`
+const callsOf = (run, who) => run.events.filter((e) => e.who === who).map((e) => e.argv)
+
+// The two kubectl calls that may precede a refusal: the node preflight and the
+// generation reads. Neither changes anything in the cluster.
+function isRead(argv) {
+  const a = argv[0] === '-n' ? argv.slice(2) : argv
+  const nodes = a.join(' ') === 'get nodes -o name'
+  const generation = a.length === 5 && a[0] === 'get' && a[1] === 'deploy' && a[4] === 'jsonpath={.metadata.generation}'
+  return nodes || generation
+}
+
+test('STORY-119 SUB-008: registry apply pulls the API image, then the web image, on the node before the first apply', (t) => {
+  const run = runDeploy(t, { deployEnv: SINGLE_HOST_ENV })
+  assert.equal(run.status, 0, run.describe())
+  assert.deepEqual(callsOf(run, 'pull'), [[API_REF], [WEB_REF]])
+  const lastPull = run.events.findLastIndex((e) => e.who === 'pull')
+  const firstApply = run.events.findIndex((e) => e.who === 'kubectl' && e.argv.includes('apply'))
+  assert.ok(firstApply > lastPull, `the first apply (event ${firstApply}) came before the last pull (event ${lastPull})`)
+  // Two good pulls, and the rest of the flow is what it was.
+  assert.equal(run.applied.length, 3, 'namespace, runtime Secret, workloads')
+  assertPinned(run, WEB_REF, API_REF)
+  assertNoOutsideParty(run)
+})
+
+test('STORY-119 SUB-008: a pull that fails stops apply before any object changes, and names the reference', (t) => {
+  for (const [failing, pulled] of [
+    [API_REF, [[API_REF]]],
+    [WEB_REF, [[API_REF], [WEB_REF]]],
+  ]) {
+    const run = runDeploy(t, { deployEnv: SINGLE_HOST_ENV, env: { STUB_PULL_FAIL: failing } })
+    assert.notEqual(run.status, 0, run.describe())
+    assert.equal(run.signal, null, run.describe())
+    assert.deepEqual(callsOf(run, 'pull'), pulled)
+    assert.match(run.stderr, new RegExp(`could not pull ${escapeRe(failing)} `))
+    assert.match(run.stderr, /must be public/)
+    assert.match(run.stderr, /pull credentials/)
+    // Nothing was applied: no namespace, no Secret, no workloads, no rollout.
+    assert.deepEqual(run.applied, [])
+    assert.ok(!existsSync(join(run.box.state, 'secret-input.env')), 'the runtime Secret was built')
+    assert.deepEqual(
+      run.kubectl.filter((argv) => !isRead(argv)),
+      [],
+      'kubectl was asked for something other than a read before the refusal',
+    )
+    assertNoOutsideParty(run)
+  }
+})
+
+test('STORY-119 SUB-008: PREPULL=0 from the caller skips the pre-pull with a warning, even over PREPULL=1 in deploy.env', (t) => {
+  const run = runDeploy(t, { deployEnv: `${SINGLE_HOST_ENV}PREPULL=1\n`, env: { PREPULL: '0' } })
+  assert.equal(run.status, 0, run.describe())
+  assert.deepEqual(callsOf(run, 'pull'), [])
+  assert.match(run.stderr, /WARNING: PREPULL=0: not pulling /)
+  assertPinned(run, WEB_REF, API_REF)
+  assertNoOutsideParty(run)
+})
+
+test('STORY-119 SUB-008: the default pull command is `sudo -n k3s crictl pull`; a PULL_CMD in deploy.env replaces it', (t) => {
+  const byDefault = runDeploy(t, { deployEnv: SINGLE_HOST_ENV, env: { PULL_CMD: undefined } })
+  assert.equal(byDefault.status, 0, byDefault.describe())
+  assert.deepEqual(callsOf(byDefault, 'sudo'), [
+    ['-n', 'k3s', 'crictl', 'pull', API_REF],
+    ['-n', 'k3s', 'crictl', 'pull', WEB_REF],
+  ])
+  assertNoOutsideParty(byDefault)
+
+  const fromFile = runDeploy(t, {
+    deployEnv: (box) => `${SINGLE_HOST_ENV}PULL_CMD=${box.pull}\n`,
+    env: { PULL_CMD: undefined },
+  })
+  assert.equal(fromFile.status, 0, fromFile.describe())
+  assert.deepEqual(callsOf(fromFile, 'pull'), [[API_REF], [WEB_REF]])
+  assert.deepEqual(callsOf(fromFile, 'sudo'), [])
+  assertNoOutsideParty(fromFile)
+})
+
+test('STORY-119 SUB-008: PREPULL and PULL_CMD are in the Optional list the script prints as its help', (t) => {
+  const run = runDeploy(t, { mode: '--help' })
+  assert.equal(run.status, 0, run.describe())
+  assert.match(run.stdout, /^\s+PREPULL\s+default 1\b/m)
+  assert.match(run.stdout, /^\s+PULL_CMD\s+default "sudo -n k3s crictl pull"/m)
+  assert.deepEqual(run.events, [], 'help reached a stub')
 })
