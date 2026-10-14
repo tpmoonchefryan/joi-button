@@ -73,6 +73,10 @@ import { fileURLToPath } from 'node:url'
 // refuses to start in production and builds the WRONG source in development.
 // One predicate, read from the roster that owns it.
 import { BYPASS_FLAGS } from './lib/env-guard.mjs'
+// Imported rather than copied, for the same reason. The room dial's per-attempt
+// bound below is DERIVED from the request timeout the transport uses; a copy of
+// today's 5_000 written here would stop being that the day the default moved.
+import { TRANSPORT_DEFAULTS } from './lib/bili-transport.mjs'
 
 const MiB = 1024 * 1024
 
@@ -318,6 +322,8 @@ export function loadConfig({ env: processEnv = process.env, envFile = DEFAULT_EN
   // to fix.
   const codeTtlMinutes = read.integer('danmaku.codeTtlMinutes') ?? DEFAULTS.codeTtlMinutes
 
+  const dialPolicy = danmakuDialPolicy()
+
   if (sessionSecret !== undefined && sessionSecret.length < MIN_SESSION_SECRET_LENGTH) {
     // Length only. The value never appears in the message — this one goes to
     // stderr, and stderr goes to the cluster log.
@@ -373,6 +379,12 @@ export function loadConfig({ env: processEnv = process.env, envFile = DEFAULT_EN
       accessKeySecret: read.secret('danmaku.accessKeySecret'),
       roomOwnerAuthCode: read.secret('danmaku.roomOwnerAuthCode'),
       codeTtlMinutes,
+      // Overrides of lib/bili-transport.mjs's TRANSPORT_DEFAULTS for this
+      // deployment. Handed down unchanged — server.mjs -> createDanmakuSource ->
+      // createProductionTransport -> createBiliTransport, which merges it over
+      // its defaults. Today it is the connect timeout alone; see
+      // danmakuDialPolicy() for the measurement and the ruling behind it.
+      transport: dialPolicy.transport,
       lifecycle: {
         // The room session is held open by leases, and the ruling is that it
         // stops on success or a 10-minute expiry. Deriving the lease TTL from
@@ -393,6 +405,11 @@ export function loadConfig({ env: processEnv = process.env, envFile = DEFAULT_EN
         // a property of a refcount. This is where the policy lives, beside the
         // other value derived from a ruling.
         lingerMs: readLingerMs(env),
+        // The bound on ONE transport.start(), derived from the connect timeout
+        // above, and the budget across all of them, unchanged. Policy for the
+        // same reason the linger is; see danmakuDialPolicy().
+        startTimeoutMs: dialPolicy.startTimeoutMs,
+        startBudgetMs: dialPolicy.startBudgetMs,
       },
     },
 
@@ -734,6 +751,61 @@ function readLingerMs(env) {
   // keep the socket open past the point where any code it was opened for could
   // still be used, which is the standing connection the ruling forbids.
   return Math.min(seconds, 10 * 60) * 1000
+}
+
+/**
+ * How long the room dial may take on THIS deployment (JOI-BUTTON-MIN-013 D1).
+ *
+ * connectTimeoutMs, 30s where lib/bili-transport.mjs defaults to 5s. That one
+ * timer covers the WebSocket handshake, sending the auth packet and waiting for
+ * AUTH_REPLY. This deployment runs in Singapore and dials danmaku servers in
+ * mainland China; measured from inside the production API container with the
+ * same Node and global WebSocket the transport uses (JOI-KB-004, 2026-10-14),
+ * 19 of 24 handshakes to the usual endpoints opened within 5s (249-2722ms) and
+ * 5 did not, and in an earlier run one of 8 had still not opened at 10s. Both
+ * failed logins of 2026-10-14 ended on the 5s timer and were reported as "we
+ * cannot hear the room" (whether still in the handshake or already awaiting
+ * AUTH_REPLY was not recorded). 30s is the ruled value, not a fitted one: a
+ * handshake that hangs past it is answered by redialling the next wss_link
+ * inside the start budget (STORY-118), not by waiting longer.
+ *
+ * startTimeoutMs, the lifecycle's bound on ONE transport.start(). It sits above
+ * every path through start(), so that the transport's own error — which stage
+ * failed — is what reaches the log rather than the lifecycle's generic "did not
+ * become ready". The longest path is a held session whose /v2/app/heartbeat
+ * fails: heartbeat, /v2/app/end, /v2/app/start, then the connect. Three gateway
+ * requests and one connect, 45s today. The ruled floor is two requests and a
+ * connect (40s); the third request is what covers the heartbeat path.
+ *
+ * startBudgetMs, the whole attempt: unchanged at 45s by the same ruling, and
+ * equal to the library default. Written here anyway so the three numbers that
+ * decide whether a slow handshake gets a second chance sit together. A first
+ * dial that hangs for the full 30s has failed by 35s (40s if it first had to
+ * end a dropped session); the redial is due 1.25s later, still inside 45s, and
+ * that is what makes the redial real. When both addresses hang, the visitor
+ * hears "unreachable" after about 62s rather than 5.
+ *
+ * Kept true by test/danmaku-dial-config.test.mjs: the connect timeout stays
+ * below the transport's wsIdleTimeoutMs (35s), because the idle watchdog is
+ * armed at onopen and would otherwise end an awaiting-auth-reply dial before
+ * the connect timer could; and the library defaults stay as they are, the same
+ * split as lingerMs above.
+ *
+ * Not an environment variable, on purpose: STORY-118 adds no switch, and a knob
+ * would let the deployed value drift from the ruling without a review noticing.
+ * Fresh objects on every call, like everything else loadConfig builds, because
+ * assertSafeConfig deep-freezes what it clears.
+ */
+function danmakuDialPolicy() {
+  const transport = { connectTimeoutMs: 30_000 }
+  // The merge createBiliTransport performs, so the bound follows the request
+  // timeout the transport will actually use.
+  const effective = { ...TRANSPORT_DEFAULTS, ...transport }
+  return {
+    transport,
+    startTimeoutMs: 3 * effective.requestTimeoutMs + effective.connectTimeoutMs,
+    startBudgetMs: 45_000,
+  }
 }
 
 function readOpenIds(env, problems) {
