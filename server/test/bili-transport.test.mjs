@@ -292,7 +292,9 @@ function testClock(startIso = '2026-08-01T00:00:00Z') {
   }
 }
 
+/** `wssUrl` may be one link or the platform's whole list of them, in order. */
 function startAnswer(wssUrl, { gameId = 'game-0001', roomId = CREDENTIALS.roomId } = {}) {
+  const wssLinks = Array.isArray(wssUrl) ? wssUrl : [wssUrl]
   return {
     status: 200,
     json: {
@@ -301,7 +303,7 @@ function startAnswer(wssUrl, { gameId = 'game-0001', roomId = CREDENTIALS.roomId
       request_id: 'req-0001',
       data: {
         game_info: { game_id: gameId },
-        websocket_info: { auth_body: JSON.stringify({ key: 'auth-token', roomid: roomId }), wss_link: [wssUrl] },
+        websocket_info: { auth_body: JSON.stringify({ key: 'auth-token', roomid: roomId }), wss_link: wssLinks },
         anchor_info: { room_id: roomId, uid: 9, uname: 'owner', uface: '', open_id: 'owner-open-id' },
       },
     },
@@ -369,6 +371,67 @@ async function wiredTransport({ gatewayHandler, onConnection, transport = {}, cr
       await ws.close()
       await gateway.close()
     },
+  }
+}
+
+/**
+ * A danmaku host that accepts the TCP connection and then never answers the
+ * websocket upgrade: the "still connecting" half of a slow cross-border
+ * handshake (JOI-BUTTON-STORY-118). The sockets are tracked so close() can
+ * destroy them; nothing else ever would.
+ *
+ * @param {{ onUpgrade?: () => void }} [hooks] called as each upgrade arrives
+ */
+function startStalledServer({ onUpgrade } = {}) {
+  const server = createServer()
+  const sockets = new Set()
+  let upgrades = 0
+  server.on('upgrade', (req, socket) => {
+    upgrades += 1
+    sockets.add(socket)
+    socket.on('error', () => {})
+    socket.on('close', () => sockets.delete(socket))
+    if (onUpgrade) onUpgrade()
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      resolve({
+        url: `ws://127.0.0.1:${port}/sub`,
+        port,
+        upgrades: () => upgrades,
+        close: () =>
+          new Promise((done) => {
+            for (const socket of sockets) socket.destroy()
+            server.close(() => done())
+          }),
+      })
+    })
+  })
+}
+
+/**
+ * The connect timeout for every case that makes a dial stall. Small, because
+ * each stalled dial costs this much real time; not smaller, because the
+ * HEALTHY dial in the same case has to finish inside it on a busy machine.
+ */
+const STALL_MS = 300
+
+/**
+ * `now` on the wall clock, for the cases that run the real lifecycle across a
+ * redial. Its retry waits are real timers, while the transport's backoff gate
+ * and the lifecycle's start budget both read `now` — with the hand-moved clock
+ * the gate would never open and the budget would never run out. None of these
+ * cases asserts anything second-precision about continuity.
+ */
+function wallClock() {
+  const timers = testClock()
+  return {
+    now: () => new Date(),
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
   }
 }
 
@@ -1255,5 +1318,445 @@ test('a /v2/app/start that succeeds with an unusable payload still ends the sess
     )
   } finally {
     await rig.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// a slow handshake is waited out, on the same session (JOI-BUTTON-STORY-118)
+//
+// 2026-10-14, production: one cross-border handshake outlasted the connect
+// timeout, the timeout was not retryable, and a visitor was told we could not
+// hear the room. JOI-BUTTON-MIN-013 D1 is what these cases hold: the connect
+// timer — and nothing else — is retryable, the game session is KEPT, and the
+// redial goes to the next wss_link on that same session after one project
+// heartbeat, with no /v2/app/end and no second /v2/app/start in between.
+
+test('a connect timeout is retryable, keeps the game session, and arms the backoff for the redial', async () => {
+  const stalled = await startStalledServer()
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url, wssUrl]) : null),
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  try {
+    await assert.rejects(
+      () => rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }),
+      (err) => {
+        assert.match(err.message, /did not authenticate within 300ms/)
+        assert.equal(err.connectTimeout, true)
+        assert.equal(err.retryable, true, 'a connect timeout was not offered for a retry')
+        // backoffDelayMs(1) + 250 with the default backoff. The redial has to
+        // land AFTER the gate opens, because the gate's refusal is final.
+        assert.equal(err.retryAfterMs, 1_250)
+        return true
+      },
+    )
+    assert.equal(stalled.upgrades(), 1, 'the first wss_link was not the one dialled')
+    const state = rig.transport.state()
+    assert.equal(state.consecutiveStartFailures, 1)
+    assert.equal(state.nextDialInMs, 1_000)
+    assert.equal(state.hasSession, true, 'the game session was not kept for the redial')
+    assert.equal(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length,
+      0,
+      'a connect timeout ended the session the redial needs; re-opening one walks into the 7001 cooldown',
+    )
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('through the lifecycle, a connect timeout redials the next wss_link on the same session, and the visitor only ever sees starting', async () => {
+  // Story AC1. The first address is connected but never answers the auth
+  // packet; the second one does. The visitor is shown 准备中 throughout.
+  const silent = []
+  const silentHost = await startWsServer((conn) => silent.push(conn)) // handshakes, never answers auth
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) =>
+      call.path === OPEN_LIVE_PATHS.start ? startAnswer([silentHost.url, wssUrl]) : null,
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const source = createDanmakuSource({
+    ...rig.config,
+    clock: wallClock(),
+    mode: 'production',
+    lifecycle: { startTimeoutMs: 2_000, heartbeatIntervalMs: 60_000 },
+  })
+  const states = []
+  source.on('status', (status) => states.push(status.state))
+  try {
+    const lease = await source.acquire()
+    assert.equal(lease.status.listening, true)
+
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.heartbeat],
+      'between the two dials there must be one project heartbeat and nothing else — no end, no second start',
+    )
+    assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.heartbeat)[0].body, { game_id: 'game-0001' })
+    assert.equal(silent.length, 1, 'the first dial did not go to the first wss_link')
+    assert.equal(rig.connections.length, 1, 'the redial did not go to the next wss_link')
+    assert.notEqual(silent[0].authBody, null, 'the first dial never sent its auth packet')
+    assert.equal(rig.connections[0].authBody, silent[0].authBody, 'the redial did not send the same auth_body verbatim')
+    assert.deepEqual(states, ['starting', 'listening'], 'the visitor saw something other than 准备中 during the redial')
+
+    // The session that was redialled is the one the visitor holds, and it is
+    // ended when they let go — not leaked because it was carried across a dial.
+    source.release(lease.leaseId)
+    await until(() => source.status().state === 'stopped', 'the source to stop when the lease went')
+    const ends = rig.gateway.callsTo(OPEN_LIVE_PATHS.end)
+    assert.equal(ends.length, 1)
+    assert.deepEqual(ends[0].body, { app_id: CREDENTIALS.appId, game_id: 'game-0001' })
+  } finally {
+    await source.stop({ force: true }).catch(() => {})
+    await rig.close()
+    await silentHost.close()
+  }
+})
+
+for (const [refusal, answer] of [
+  ['answers 7003', () => ({ status: 200, json: { code: 7003, message: 'closed' } })],
+  ['fails with HTTP 502', () => ({ status: 502, json: { code: -502, message: 'bad gateway' } })],
+]) {
+  test(`a held session whose heartbeat ${refusal} is ended, and a new session is opened in its place`, async () => {
+    const stalled = await startStalledServer()
+    let starts = 0
+    const rig = await wiredTransport({
+      gatewayHandler: (call, wssUrl) => {
+        if (call.path === OPEN_LIVE_PATHS.start) {
+          starts += 1
+          return startAnswer([stalled.url, wssUrl], { gameId: `game-000${starts}` })
+        }
+        if (call.path === OPEN_LIVE_PATHS.heartbeat) return answer()
+        return null
+      },
+      transport: { connectTimeoutMs: STALL_MS },
+    })
+    const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+    try {
+      await assert.rejects(() => rig.transport.start(handlers), (err) => err.retryable === true)
+      rig.clock.advance(1_250) // what the lifecycle waits before it redials
+      await rig.transport.start(handlers)
+
+      assert.deepEqual(
+        rig.gateway.calls.map((call) => call.path),
+        [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.heartbeat, OPEN_LIVE_PATHS.end, OPEN_LIVE_PATHS.start],
+        'a held session was dialled without being confirmed, or replaced without being ended',
+      )
+      assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.heartbeat)[0].body, { game_id: 'game-0001' })
+      assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.end)[0].body, {
+        app_id: CREDENTIALS.appId,
+        game_id: 'game-0001',
+      })
+      const state = rig.transport.state()
+      assert.equal(state.authenticated, true)
+      assert.equal(state.hasSession, true)
+      assert.equal(state.consecutiveStartFailures, 0)
+      // The new session's dial still rotated past the address that stalled.
+      assert.equal(stalled.upgrades(), 1)
+      assert.equal(rig.connections.length, 1)
+    } finally {
+      await rig.transport.stop().catch(() => {})
+      await rig.close()
+      await stalled.close()
+    }
+  })
+}
+
+test('a held session is ended by stop(), exactly once, and is not reused afterwards', async () => {
+  const stalled = await startStalledServer()
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url, wssUrl]) : null),
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+  try {
+    await assert.rejects(() => rig.transport.start(handlers), (err) => err.retryable === true)
+    assert.equal(rig.transport.state().hasSession, true)
+
+    await rig.transport.stop()
+    assert.equal(rig.transport.state().hasSession, false, 'stop() left the held session in place')
+    await rig.transport.stop()
+    const ends = rig.gateway.callsTo(OPEN_LIVE_PATHS.end)
+    assert.equal(ends.length, 1, 'the held session was not ended exactly once')
+    assert.deepEqual(ends[0].body, { app_id: CREDENTIALS.appId, game_id: 'game-0001' })
+
+    // Nothing is carried over: the next start opens a session of its own and
+    // never heartbeats the one stop() ended.
+    rig.clock.advance(1_250)
+    await rig.transport.start(handlers)
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end, OPEN_LIVE_PATHS.start],
+    )
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('a held session is ended when its redial fails for any reason other than another timeout', async () => {
+  // One redial that is REFUSED rather than slow: the session it was kept for
+  // has nothing left to wait for, so the failure path ends it as it always did.
+  const stalled = await startStalledServer()
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url, wssUrl]) : null),
+    onConnection: rejectingAuth, // the second address, where the redial goes
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+  try {
+    await assert.rejects(() => rig.transport.start(handlers), (err) => err.retryable === true)
+    rig.clock.advance(1_250)
+    await assert.rejects(
+      () => rig.transport.start(handlers),
+      (err) => {
+        assert.match(err.message, /rejected our auth packet \(code -101\)/)
+        assert.notEqual(err.retryable, true)
+        return true
+      },
+    )
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.heartbeat, OPEN_LIVE_PATHS.end],
+    )
+    assert.equal(rig.transport.state().hasSession, false)
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('through the lifecycle, when both addresses stall the budget runs out: no third dial, and the held session is ended once', async () => {
+  const silent = []
+  const silentHost = await startWsServer((conn) => silent.push(conn))
+  const stalled = await startStalledServer()
+  const rig = await wiredTransport({
+    gatewayHandler: (call) =>
+      call.path === OPEN_LIVE_PATHS.start ? startAnswer([silentHost.url, stalled.url]) : null,
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  // On the wall clock: the first timeout lands near 300ms and asks for 1250ms,
+  // which fits in 3000; the second lands near 1850ms and asks for 2250ms, which
+  // does not. Both margins are over a second.
+  const source = createDanmakuSource({
+    ...rig.config,
+    clock: wallClock(),
+    mode: 'production',
+    lifecycle: { startTimeoutMs: 2_000, startBudgetMs: 3_000, heartbeatIntervalMs: 60_000 },
+  })
+  try {
+    await assert.rejects(
+      () => source.acquire(),
+      (err) => {
+        // The transport's own, phase-specific error — not the lifecycle's
+        // generic timeout, and not a backoff refusal.
+        assert.match(err.message, /bili transport: the danmaku socket did not authenticate within 300ms/)
+        return true
+      },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 100)) // room for a third dial or a second end to show
+    assert.equal(silent.length, 1)
+    assert.equal(stalled.upgrades(), 1, 'the budget was spent and a third dial still happened')
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.heartbeat, OPEN_LIVE_PATHS.end],
+      'the held session was leaked, or ended twice',
+    )
+    assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.end)[0].body, {
+      app_id: CREDENTIALS.appId,
+      game_id: 'game-0001',
+    })
+    assert.equal(source.status().state, 'failed')
+  } finally {
+    await source.stop({ force: true }).catch(() => {})
+    await rig.close()
+    await silentHost.close()
+    await stalled.close()
+  }
+})
+
+function rejectingAuth(conn) {
+  const timer = setInterval(() => {
+    if (conn.authBody === null) return
+    clearInterval(timer)
+    conn.sendPacket({
+      operation: OPERATION.AUTH_REPLY,
+      protocolVersion: PROTO_VERSION.NORMAL,
+      body: JSON.stringify({ code: -101 }),
+    })
+  }, 2)
+  timer.unref?.()
+}
+
+function closingBeforeAuth(conn) {
+  const timer = setInterval(() => {
+    if (conn.authBody === null) return
+    clearInterval(timer)
+    // A clean close frame, then the end of the stream.
+    if (!conn.socket.destroyed) conn.socket.end(encodeServerFrame(Buffer.alloc(0), 0x8))
+  }, 2)
+  timer.unref?.()
+}
+
+function droppingBeforeAuth(conn) {
+  const timer = setInterval(() => {
+    if (conn.authBody === null) return
+    clearInterval(timer)
+    conn.drop()
+  }, 2)
+  timer.unref?.()
+}
+
+for (const [what, setup, expected] of [
+  ['an auth rejection', { onConnection: rejectingAuth }, /rejected our auth packet \(code -101\)/],
+  ['a socket closed before auth', { onConnection: closingBeforeAuth }, /(closed|errored) before authenticating/],
+  ['a socket dropped before auth', { onConnection: droppingBeforeAuth }, /(closed|errored) before authenticating/],
+  [
+    'a room that does not match BILI_ROOM_ID',
+    {
+      gatewayHandler: (call, wssUrl) =>
+        call.path === OPEN_LIVE_PATHS.start ? startAnswer(wssUrl, { roomId: 999_999 }) : null,
+    },
+    /opened room 999999, but BILI_ROOM_ID is 424242/,
+  ],
+]) {
+  test(`through the lifecycle, ${what} is dialled once, never retried, and its session is ended`, async () => {
+    // Waiting does not fix these, so they fail exactly as they did before
+    // MIN-013 D1. On the wall clock, so a retry that should not happen would
+    // actually get through the backoff gate and show up as a second start.
+    const rig = await wiredTransport({ ...setup, transport: { connectTimeoutMs: 2_000 } })
+    const source = createDanmakuSource({
+      ...rig.config,
+      clock: wallClock(),
+      mode: 'production',
+      lifecycle: { startTimeoutMs: 3_000, heartbeatIntervalMs: 60_000 },
+    })
+    try {
+      await assert.rejects(() => source.acquire(), expected)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length, 1, 'a hard failure was retried')
+      assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 1, 'the session was left running')
+      assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.heartbeat).length, 0)
+      assert.ok(rig.connections.length <= 1, 'a hard failure was redialled')
+      assert.equal(source.status().state, 'failed')
+    } finally {
+      await source.stop({ force: true }).catch(() => {})
+      await rig.close()
+    }
+  })
+}
+
+test('a stop() that lands mid-dial: the timeout that follows is not retryable, nothing is kept, and the session is ended once', async () => {
+  let arrived
+  const upgraded = new Promise((resolve) => {
+    arrived = resolve
+  })
+  const stalled = await startStalledServer({ onUpgrade: () => arrived() })
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      return startAnswer(starts === 1 ? stalled.url : wssUrl, { gameId: `game-000${starts}` })
+    },
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+  try {
+    const outcome = rig.transport.start(handlers).then(
+      () => null,
+      (err) => err,
+    )
+    await upgraded
+    await rig.transport.stop()
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 1, 'stop() did not end the session')
+
+    const err = await outcome
+    assert.ok(err instanceof Error, 'a dial that was stopped resolved as if it had authenticated')
+    assert.match(err.message, /did not authenticate within 300ms/)
+    assert.notEqual(err.retryable, true, 'a dial nobody is waiting for asked to be retried')
+    assert.equal(err.retryAfterMs, undefined)
+    const state = rig.transport.state()
+    assert.equal(state.hasSession, false, 'a stopped dial kept its session')
+    // A dial cancelled by stop() says nothing about the room: not counted, and
+    // no backoff for the next visitor to run into.
+    assert.equal(state.consecutiveStartFailures, 0)
+    assert.equal(state.nextDialInMs, 0)
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 1, 'the session was ended twice')
+
+    await rig.transport.start(handlers)
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end, OPEN_LIVE_PATHS.start],
+      'the next start heartbeated a session that stop() had already ended',
+    )
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('a dial that was stopped does not reach into the session a later start opened', async () => {
+  // The connect timer outlives stop() by up to connectTimeoutMs — 30s in
+  // production — and a new visitor can open and authenticate a session inside
+  // that window. When the old timer fires it must not close the new socket
+  // (that would deafen it silently: its handlers go with it) nor end the new
+  // session from its failure path.
+  let arrived
+  const upgraded = new Promise((resolve) => {
+    arrived = resolve
+  })
+  const stalled = await startStalledServer({ onUpgrade: () => arrived() })
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      return startAnswer(starts === 1 ? stalled.url : wssUrl, { gameId: `game-000${starts}` })
+    },
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const heard = []
+  const disconnects = []
+  try {
+    const stale = rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }).then(
+      () => null,
+      (err) => err,
+    )
+    await upgraded
+    await rig.transport.stop()
+    await rig.transport.start({ onDanmaku: (d) => heard.push(d), onDisconnect: (info) => disconnects.push(info) })
+    assert.equal(rig.transport.state().authenticated, true)
+
+    const err = await stale // the old connect timer has now fired
+    assert.match(err.message, /did not authenticate within 300ms/)
+    assert.notEqual(err.retryable, true, 'a dial nobody is waiting for asked to be retried')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const state = rig.transport.state()
+    assert.equal(state.authenticated, true, "the stale dial's timer closed the live socket")
+    assert.equal(state.hasSession, true)
+    // Nor does it count against the live session or gate the next dial: had it
+    // been taken for a timeout of the LIVE session, that session would now be
+    // marked as held for a redial, and a reconnect would be refused for 1s.
+    assert.equal(state.consecutiveStartFailures, 0)
+    assert.equal(state.nextDialInMs, 0)
+    assert.deepEqual(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.end).map((call) => call.body.game_id),
+      ['game-0001'],
+      "the stale dial's failure path ended the live session",
+    )
+    assert.deepEqual(disconnects, [])
+    rig.connections[0].send(danmakuPacket({ openId: 'open-live', uname: 'Live', msg: 'JOI-LIVE' }))
+    await until(() => heard.length === 1, 'a danmaku on the live socket')
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
   }
 })

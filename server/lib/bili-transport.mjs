@@ -105,7 +105,32 @@
 //     red. The lifecycle reconnects by calling start() again WITHOUT calling
 //     stop() in between (see scheduleReconnect in danmaku-source.mjs), so if
 //     start() did not release what it holds, every reconnect would leak one
-//     session the platform believes is still running.
+//     session the platform believes is still running. There is exactly ONE
+//     exception, and it is deliberate: a connect timeout keeps the session for
+//     the redial (see start()). It is still ended — by stop(), by a refused
+//     heartbeat on it, or by any redial failure other than another timeout —
+//     and the "held session is ended" cases go red if any of those forgets.
+//   * Make a connect timeout non-retryable again — the "a connect timeout
+//     redials the next wss_link on the same session" lifecycle case goes red.
+//     That is the 2026-10-14 production failure (JOI-BUTTON-STORY-118): one
+//     slow cross-border handshake told a visitor we could not hear the room,
+//     when a second address 1.25s later would have.
+//   * End the session on a connect timeout instead of keeping it — the same
+//     case goes red on "no /v2/app/end between the two dials". Re-opening walks
+//     into the platform's 7001 cooldown (JOI-BUTTON-INC-006) and spends the
+//     visitor's start budget waiting for it.
+//   * Dial a held session without the project heartbeat first — the "held
+//     session whose heartbeat answers 7003 / fails" cases go red on the
+//     gateway's call sequence.
+//   * Retry anything but the connect timer — an auth rejection, a socket that
+//     errored or closed before auth, the wrong room — and the "dialled once,
+//     never retried" lifecycle cases go red on the gateway's start count.
+//   * Let a connect timeout that lands after stop() count itself, mark itself
+//     retryable or keep a session, or let its failure path close the socket or
+//     end the session a LATER start opened — the "stop() that lands mid-dial"
+//     and "does not reach into the session a later start opened" cases go red.
+//     Nobody is waiting for that dial any more; acting on its timeout would
+//     retry for nobody, or deafen the visitor who came next.
 //   * Make the backoff a constant instead of a doubling, or let a start dial
 //     while backing off — the backoff case goes red on the recorded delays and
 //     on the gateway's call count respectively.
@@ -237,6 +262,14 @@ export const TRANSPORT_DEFAULTS = Object.freeze({
    */
   wsIdleTimeoutMs: 35_000,
   requestTimeoutMs: 5_000,
+  /**
+   * One dial: the TLS + websocket handshake, sending the auth packet and
+   * waiting for AUTH_REPLY, all under one timer. When it fires the error is
+   * marked `connectTimeout` and start() treats it as the one retryable dial
+   * failure (see start()). The library default stays 5s; a deployment's value
+   * is policy and lives in server/config.mjs (JOI-BUTTON-MIN-013 D1: 30s in
+   * production, where the danmaku hosts are across a border).
+   */
   connectTimeoutMs: 5_000,
   /** How long a closing socket has to actually close before we count it. See closeSocket(). */
   closeGraceMs: 5_000,
@@ -589,6 +622,17 @@ export function createBiliTransport(config = {}) {
   // --- everything mutable ---------------------------------------------------
   let handlers = { onDanmaku: null, onDisconnect: null }
   let session = null // { gameId, authBody, wssLinks, roomId }
+  // The start() call that opened or took over `session`, by identity. Only
+  // read when a stop() has landed mid-start: from then on the stopped start
+  // may release a session it opened itself, and must not touch one a LATER
+  // start opened while it was still waiting on its connect timer.
+  let sessionOwner = null
+  // `session` itself when it was kept after a connect timeout for the next
+  // start() to redial on, else null. See start().
+  let retainedSession = null
+  // Bumped by every stop(). A start() compares it with the value it began
+  // with to know whether anyone is still waiting for it.
+  let stopCount = 0
   let socket = null
   let socketGeneration = 0 // bumped on every teardown; late events check it
   let wsHeartbeatTimer = null
@@ -696,7 +740,7 @@ export function createBiliTransport(config = {}) {
    * `code` is the room owner's auth code from play-live.bilibili.com, which is
    * what scopes this app to exactly one room; there is no room id in the request.
    */
-  async function startGameSession() {
+  async function startGameSession(owner) {
     const result = refuseNonZero(
       OPEN_LIVE_PATHS.start,
       await callGateway(OPEN_LIVE_PATHS.start, { code: roomOwnerAuthCode, app_id: appId }),
@@ -723,6 +767,7 @@ export function createBiliTransport(config = {}) {
     // room, at which point the visitor is told the room is unreachable because
     // of our bookkeeping.
     session = { gameId, authBody: null, wssLinks: null, roomId: anchorRoomId ?? null }
+    sessionOwner = owner
 
     if (typeof authBody !== 'string' || authBody === '') {
       throw new OpenPlatformError('bili gateway: /v2/app/start returned no websocket_info.auth_body', {
@@ -874,12 +919,18 @@ export function createBiliTransport(config = {}) {
       // The lifecycle's startTimeoutMs is the outer bound on the whole start;
       // this is the inner one, so a socket that never opens is closed by the
       // side that owns it rather than abandoned half-open.
+      //
+      // The one dial failure start() retries on its own, so it is MARKED here,
+      // at the only place it is made, and start() reads the mark rather than
+      // matching this message. Every other way a dial fails — an auth
+      // rejection, a send that threw, an error or close before auth — is
+      // created elsewhere without it and stays a hard failure.
       const connectTimer = clock.setTimeout(() => {
-        finish(
-          new OpenPlatformError(
-            `bili transport: the danmaku socket did not authenticate within ${opts.connectTimeoutMs}ms`,
-          ),
+        const timedOut = new OpenPlatformError(
+          `bili transport: the danmaku socket did not authenticate within ${opts.connectTimeoutMs}ms`,
         )
+        timedOut.connectTimeout = true
+        finish(timedOut)
       }, opts.connectTimeoutMs)
 
       function finish(err) {
@@ -887,7 +938,12 @@ export function createBiliTransport(config = {}) {
         settled = true
         clock.clearTimeout(connectTimer)
         if (err) {
-          closeSocket()
+          // Only while this dial's socket is still THE socket. A stop() that
+          // landed mid-dial has already closed it, and this connect timer
+          // keeps running after that; by the time it fires a later start may
+          // own `socket`, and closing it from here would deafen that start
+          // with its handlers nulled, i.e. silently.
+          if (socket === ws) closeSocket()
           reject(err)
         } else {
           resolve()
@@ -1044,6 +1100,10 @@ export function createBiliTransport(config = {}) {
     closeSocket()
     const held = session
     session = null
+    sessionOwner = null
+    // A session kept after a connect timeout IS `session`, so this ends it
+    // too: stop() and every failure path release a held session through here.
+    retainedSession = null
     if (!endSession || held === null) return
     await endGameSession(held.gameId)
   }
@@ -1054,8 +1114,50 @@ export function createBiliTransport(config = {}) {
     return Math.min(raw, opts.backoff.maxDelayMs)
   }
 
+  /**
+   * A session kept after a connect timeout, asked whether it is still alive.
+   *
+   * One project heartbeat ([OFFICIAL] BApi.cs:84-92, the body heartbeat()
+   * sends): code 0 renews it and it is dialled again as it is, same auth_body,
+   * next wss_link. Anything else — a non-zero code such as 7003 (closed under
+   * us), or no answer at all — means it cannot be trusted, so it is ended here
+   * and the caller opens a fresh one, which may meet the 7001 cooldown; that is
+   * handled where it always was.
+   *
+   * Returns the session to dial, or null when start() must open a new one.
+   */
+  async function confirmRetainedSession(owner) {
+    const held = session
+    retainedSession = null
+    sessionOwner = owner
+    let alive = false
+    try {
+      stats.appBeatsSent += 1
+      const beat = await callGateway(OPEN_LIVE_PATHS.heartbeat, { game_id: held.gameId })
+      alive = beat.code === 0
+    } catch {
+      // No answer is no confirmation. The fresh session below either works or
+      // fails with its own, more specific, error.
+      alive = false
+    }
+    // A stop() that landed while we asked has already ended it.
+    if (session !== held) return null
+    if (alive) return held
+    try {
+      await releaseAll({ endSession: true })
+    } catch (err) {
+      defer(err)
+    }
+    return null
+  }
+
   async function start({ onDanmaku, onDisconnect } = {}) {
     handlers = { onDanmaku: onDanmaku ?? null, onDisconnect: onDisconnect ?? null }
+    // Which stop() this start belongs to, and an identity for the session it
+    // opens or takes over. A stop() that lands mid-start owns the teardown from
+    // then on: see the failure path below.
+    const stopsAtEntry = stopCount
+    const owner = {}
 
     // The backoff is a GATE, not a sleep. Sleeping here would burn the
     // lifecycle's startTimeoutMs on doing nothing, and a backoff longer than
@@ -1071,18 +1173,45 @@ export function createBiliTransport(config = {}) {
       // visitor's whole start budget and then fail anyway, turning a clear
       // error into a slow one. Only the platform's cooldown, which is known to
       // clear, is retryable; see COOLDOWN_CODES.
+      //
+      // A connect timeout arms this gate too, but the redial it asks for is told
+      // to wait past it (retryAfterMs, below), so the gate only ever refuses a
+      // start that arrives EARLY — a new visitor in the second or two after the
+      // previous one's dials ran out of budget, say.
       throw new OpenPlatformError(
         `bili transport: still backing off after ${consecutiveStartFailures} consecutive failures — ` +
           `not dialling the room for another ${waitMs}ms. We are deaf, not idle.`,
       )
     }
 
+    // A session the previous start kept after a connect timeout is REUSED, not
+    // ended: one project heartbeat, then the same auth_body on the next
+    // wss_link, with no /v2/app/end and no second /v2/app/start in between.
+    // Ending it and opening another is what a re-dial must not do — the
+    // platform answers a start right after an end with 7001 for up to ~15s
+    // (JOI-BUTTON-INC-006), and a visitor's start budget cannot pay for a 30s
+    // dial AND that wait. [BLIVEDM] open_live.py does the same: it keeps the
+    // session and rotates wss_link by retry count under one auth_body.
+    let reused = null
+    if (retainedSession !== null && retainedSession === session) {
+      reused = await confirmRetainedSession(owner)
+      if (stopCount !== stopsAtEntry) {
+        // The stop ended the held session (it was `session` when it ran) and
+        // nobody is waiting for this start any more. Dialling now would open a
+        // socket for nobody.
+        throw new OpenPlatformError(
+          'bili transport: stopped while the held app session was being confirmed — not dialling',
+        )
+      }
+    }
+
     // The lifecycle reconnects by calling start() again WITHOUT an intervening
     // stop() (scheduleReconnect in danmaku-source.mjs), so this is the only
-    // place a session opened by the previous attempt gets ended. Best effort:
-    // failing to end an old session must not stop us opening a new one, or one
-    // platform hiccup would keep the room unreachable for as long as it lasted.
-    if (session !== null) {
+    // place a session opened by the previous attempt gets ended — the one
+    // exception being the session reused just above. Best effort: failing to
+    // end an old session must not stop us opening a new one, or one platform
+    // hiccup would keep the room unreachable for as long as it lasted.
+    if (reused === null && session !== null) {
       try {
         await releaseAll({ endSession: true })
       } catch (err) {
@@ -1091,36 +1220,69 @@ export function createBiliTransport(config = {}) {
     }
 
     try {
-      const opened = await startGameSession()
-      session = opened
+      let target = reused
+      if (target === null) {
+        target = await startGameSession(owner)
+        session = target
+        sessionOwner = owner
 
-      if (opened.roomId !== null && opened.roomId !== roomId) {
-        // Listening to the wrong room is deafness that looks exactly like
-        // listening: the socket is up, packets arrive, and no code ever matches.
-        // env-guard calls BILI_ROOM_ID "the only room whose danmaku confer
-        // identity", so a mismatch means the auth code and the room id name
-        // different rooms and one of them is wrong.
-        throw new OpenPlatformError(
-          `bili transport: the auth code opened room ${opened.roomId}, but BILI_ROOM_ID is ${roomId}. ` +
-            'Refusing to listen to a room whose danmaku are not the ones that confer identity here.',
-        )
+        // Checked once, when the session is opened. A reused session is that
+        // same session, so it is not asked again.
+        if (target.roomId !== null && target.roomId !== roomId) {
+          // Listening to the wrong room is deafness that looks exactly like
+          // listening: the socket is up, packets arrive, and no code ever matches.
+          // env-guard calls BILI_ROOM_ID "the only room whose danmaku confer
+          // identity", so a mismatch means the auth code and the room id name
+          // different rooms and one of them is wrong.
+          throw new OpenPlatformError(
+            `bili transport: the auth code opened room ${target.roomId}, but BILI_ROOM_ID is ${roomId}. ` +
+              'Refusing to listen to a room whose danmaku are not the ones that confer identity here.',
+          )
+        }
       }
 
       // Round-robin across the offered endpoints so a single bad host is
-      // survivable — [BLIVEDM] open_live.py:287 indexes by retry count.
-      const url = opened.wssLinks[consecutiveStartFailures % opened.wssLinks.length]
-      await openSocket(url, opened.authBody)
+      // survivable — [BLIVEDM] open_live.py:287 indexes by retry count. A
+      // connect timeout has already counted itself, so the redial lands on the
+      // NEXT address rather than the one that just stalled.
+      const url = target.wssLinks[consecutiveStartFailures % target.wssLinks.length]
+      await openSocket(url, target.authBody)
 
       consecutiveStartFailures = 0
       nextDialAllowedAtMs = 0
       consecutiveHeartbeatFailures = 0
     } catch (err) {
+      // A stop() landed while this start was in flight. The stop has already
+      // closed the socket and ended the session it could see, and nobody is
+      // waiting for this start any more: its failure says nothing about the
+      // room, so it is not counted, arms no backoff, is never retryable and
+      // keeps nothing — a retry would open a session nobody holds.
+      const stopped = stopCount !== stopsAtEntry
       // A cooldown is the platform saying "not yet", so it is gated like a
       // failure — we must not dial again immediately — but it is NOT COUNTED as
       // one. Counting it would double our own backoff on top of the platform's
       // wait and, worse, would make the NEXT genuine failure start from an
       // inflated count. The delay is flat and the failure count is untouched.
       const cooling = err instanceof OpenPlatformError && COOLDOWN_CODES.includes(err.platformCode)
+      // The connect timer, and nothing else (see openSocket): the one dial
+      // failure that waiting and another address can fix. JOI-BUTTON-MIN-013 D1.
+      const stalled = !stopped && err instanceof OpenPlatformError && err.connectTimeout === true && session !== null
+      if (stalled) {
+        // Counted, so the backoff gate arms and the redial rotates to the next
+        // wss_link; retryable, so the lifecycle redials inside the visitor's
+        // start budget while its state stays 'starting'. The session is KEPT
+        // for that redial and the socket is already closed (finish() did it),
+        // so nothing is released here. retryAfterMs carries the same margin as
+        // the cooldown below, for the same reason: the redial must land after
+        // the gate opens, because the gate's own refusal is not retryable.
+        consecutiveStartFailures += 1
+        const backoffMs = backoffDelayMs(consecutiveStartFailures)
+        nextDialAllowedAtMs = clock.now().getTime() + backoffMs
+        err.retryAfterMs = backoffMs + 250
+        err.retryable = true
+        retainedSession = session
+        throw err
+      }
       if (cooling) {
         nextDialAllowedAtMs = clock.now().getTime() + opts.cooldownRetryMs
         // The one thing a caller needs in order to do something better than
@@ -1132,7 +1294,7 @@ export function createBiliTransport(config = {}) {
         // convert a cooldown we were waiting out into a hard failure.
         err.retryAfterMs = opts.cooldownRetryMs + 250
         err.retryable = true
-      } else {
+      } else if (!stopped) {
         consecutiveStartFailures += 1
         nextDialAllowedAtMs = clock.now().getTime() + backoffDelayMs(consecutiveStartFailures)
       }
@@ -1140,22 +1302,33 @@ export function createBiliTransport(config = {}) {
       // lifecycle does call stop() after a failed start, but only when it still
       // owns the source — the generation guard in its error handler declines
       // otherwise, and a leaked session outlives both of us.
-      try {
-        await releaseAll({ endSession: true })
-      } catch (endErr) {
-        defer(endErr)
+      //
+      // After a stop, ONLY a session this start opened itself. The connect
+      // timer outlives the stop by up to connectTimeoutMs, and in that time a
+      // later start may have opened `session` and `socket`; releasing them from
+      // here would end a visitor's live session from under them.
+      if (!stopped || sessionOwner === owner) {
+        try {
+          await releaseAll({ endSession: true })
+        } catch (endErr) {
+          defer(endErr)
+        }
       }
       throw err
     }
   }
 
   async function stop() {
+    // Every start() still in flight is now one nobody is waiting for; see the
+    // `stopped` branch of its failure path.
+    stopCount += 1
     handlers = { onDanmaku: null, onDisconnect: null }
     consecutiveHeartbeatFailures = 0
     // Rejects if the platform refuses the end. That reaches the lifecycle's
     // 'error' listeners (scheduleStop catches it) and the process shutdown path
     // logs it, which is where a session we could not close belongs — silence
-    // here is a session running on the platform that nobody knows about.
+    // here is a session running on the platform that nobody knows about. A
+    // session kept after a connect timeout is `session`, so it ends here too.
     await releaseAll({ endSession: true })
   }
 
