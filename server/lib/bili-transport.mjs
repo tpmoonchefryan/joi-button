@@ -137,6 +137,26 @@
 //     session that answer opens is dialled and left running for nobody. The
 //     stop found nothing to end, so that start is the only side that can end
 //     it (JOI-BUTTON-STORY-121).
+//   * Drop the wait at the end of stop() — the "does not settle until the
+//     session that answer opened has been ended" case goes red: stop() settles
+//     before the /v2/app/end goes out. On a deploy the process exits the moment
+//     stop() settles (server.mjs), so the start that stop overtook never gets
+//     to end the session its answer opens (JOI-BUTTON-SUB-019).
+//   * Drop the wait at the top of start() — the "a start that arrives while a
+//     stopped start is still being answered waits for it" case goes red on the
+//     gateway's /v2/app/start count: the new start asks while the overtaken one
+//     is still being answered, and when that answer lands startGameSession()
+//     takes `session` over from the new start, whose socket the overtaken
+//     start's clean-up then closes, leaving the new session running for nobody.
+//     Drop the stop check after that wait and the "cancelled by a stop of its
+//     own before it asks for anything" case goes red: it asks for a session
+//     nobody is waiting for.
+//   * Wait for a start that is already dialling — "a dial that a stop()
+//     overtakes still reports to the onDial it was started with" goes red: its
+//     record arrives before stop() returns, because stop() sat out a connect
+//     timer (30s in production) after it had already closed that dial's socket
+//     and ended its session itself. Drop the bound on either wait and the
+//     "only up to their bounds" case goes red.
 //   * Make the backoff a constant instead of a doubling, or let a start dial
 //     while backing off — the backoff case goes red on the recorded delays and
 //     on the gateway's call count respectively.
@@ -589,7 +609,9 @@ export function dialHost(url) {
  *                                       onDial is optional and gets one record
  *                                       per dial, {host, phase, elapsedMs,
  *                                       attempt, outcome} — see openSocket()
- *   stop()                              releases everything, both halves
+ *   stop()                              releases everything, both halves,
+ *                                       then waits (bounded) for any start
+ *                                       it caught before its dial — see stop()
  *   heartbeat()                         SYNCHRONOUS, may throw, never thenable
  *
  * config (this is config.danmaku, handed over by createDanmakuSource verbatim):
@@ -668,6 +690,17 @@ export function createBiliTransport(config = {}) {
   // Bumped by every stop(). A start() compares it with the value it began
   // with to know whether anyone is still waiting for it.
   let stopCount = 0
+  // Every start() that is still OPENING, as { passed }: on its way to a dial —
+  // waiting on an earlier start, confirming a held session, ending the
+  // previous one, or waiting on /v2/app/start — and `passed` settles when it
+  // dials or settles, whichever comes first. This is the stretch a stop()
+  // cannot reach into: what such a start is about to open does not exist yet,
+  // so only that start can end it, and it has to still be running to do so.
+  // stop() and every later start() wait for it to get past here, each with a
+  // bound (JOI-BUTTON-SUB-019). A start that is dialling is not in here: all
+  // it holds is `socket` and `session`, which stop() closes and ends itself,
+  // and its connect timer already declines to touch what a later start opened.
+  const opening = new Set()
   let socket = null
   let socketGeneration = 0 // bumped on every teardown; late events check it
   let wsHeartbeatTimer = null
@@ -1268,7 +1301,75 @@ export function createBiliTransport(config = {}) {
     return null
   }
 
-  async function start({ onDanmaku, onDisconnect, onDial } = {}) {
+  /**
+   * Wait for `passed`, which never rejects, but for no longer than `ms` on the
+   * injected clock; the timer is cleared the moment the wait is over. Bounded
+   * because stop() sits on the shutdown path and start() on a visitor's, and
+   * neither may wait on another start for longer than that start's requests
+   * to the platform can legitimately take.
+   */
+  async function settleWithin(passed, ms) {
+    let timer = null
+    try {
+      await Promise.race([
+        passed,
+        new Promise((resolve) => {
+          timer = clock.setTimeout(resolve, ms)
+        }),
+      ])
+    } finally {
+      clock.clearTimeout(timer)
+    }
+  }
+
+  /**
+   * The lifecycle's start(). Before startAfter() does anything, it waits for
+   * every start that is still OPENING (see `opening`), for at most
+   * requestTimeoutMs, and it counts as opening itself until it dials or
+   * settles (JOI-BUTTON-SUB-019).
+   *
+   * Without the wait, a start that arrives after a stop() runs alongside the
+   * start that stop overtook. When the overtaken start's /v2/app/start answers,
+   * startGameSession() makes ITS session `session` and its owner the owner,
+   * over the new start's; its clean-up then closes the new start's socket and
+   * ends only its own session, and the new session runs on for nobody.
+   *
+   * A bound of requestTimeoutMs is enough for that case: the overtaken start's
+   * /v2/app/start went out before this start arrived, so its answer or its
+   * request timeout lands inside the bound, and by then its clean-up has let go
+   * of `session` and `socket` — releaseAll() does that before it awaits the
+   * /v2/app/end. The one path that can outlast the bound is a start the stop
+   * caught while it was still ending the previous session: that start sends
+   * its /v2/app/start only once the end has answered.
+   *
+   * Through the lifecycle the wait only ever follows a stop(): it makes a new
+   * start once the previous one has settled, or after stopping the transport
+   * when it gave up on one. That stop() also let go of any held session, so a
+   * start that waited goes on to one /v2/app/start and one connect — inside the
+   * lifecycle's startTimeoutMs, which is sized for three requests and a connect.
+   */
+  function start(callbacks) {
+    const earlier = [...opening].map((turn) => turn.passed)
+    let pass = null
+    const turn = {
+      passed: new Promise((resolve) => {
+        pass = resolve
+      }),
+    }
+    const leave = () => {
+      opening.delete(turn)
+      pass()
+    }
+    opening.add(turn)
+    const run = startAfter(earlier, leave, callbacks)
+    // Subscribed before the caller can subscribe to `run`, so by the time the
+    // caller hears how this start went it is no longer opening, and a stop() or
+    // start() made from there does not wait for it.
+    run.then(leave, leave)
+    return run
+  }
+
+  async function startAfter(earlier, leave, { onDanmaku, onDisconnect, onDial } = {}) {
     handlers = { onDanmaku: onDanmaku ?? null, onDisconnect: onDisconnect ?? null }
     // Held by this call and handed to its dial, NOT kept in `handlers`: stop()
     // nulls those, and a dial a stop overtakes still owes its record to the
@@ -1279,6 +1380,17 @@ export function createBiliTransport(config = {}) {
     // then on: see the failure path below.
     const stopsAtEntry = stopCount
     const owner = {}
+
+    // The starts that were still opening when this one arrived; see start().
+    // A stop() that lands while we wait has overtaken this start as well, so it
+    // ends here, before it has asked for anything: nothing to end, not
+    // counted, no backoff, never retryable.
+    if (earlier.length > 0) {
+      await settleWithin(Promise.all(earlier), opts.requestTimeoutMs)
+      if (stopCount !== stopsAtEntry) {
+        throw new OpenPlatformError('bili transport: stopped while an earlier start was settling — not dialling')
+      }
+    }
 
     // The backoff is a GATE, not a sleep. Sleeping here would burn the
     // lifecycle's startTimeoutMs on doing nothing, and a backoff longer than
@@ -1383,6 +1495,11 @@ export function createBiliTransport(config = {}) {
       // connect timeout has already counted itself, so the redial lands on the
       // NEXT address rather than the one that just stalled.
       const url = target.wssLinks[consecutiveStartFailures % target.wssLinks.length]
+      // No longer opening: from here on all this start holds is `session` and
+      // the `socket` openSocket() sets before it returns, and stop() reaches
+      // both by itself. Not waiting on the dial is what keeps a stop() during a
+      // 30s handshake from sitting the handshake out.
+      leave()
       await openSocket(url, target.authBody, { attempt: consecutiveStartFailures + 1, onDial: reportTo })
 
       consecutiveStartFailures = 0
@@ -1461,12 +1578,27 @@ export function createBiliTransport(config = {}) {
     stopCount += 1
     handlers = { onDanmaku: null, onDisconnect: null }
     consecutiveHeartbeatFailures = 0
-    // Rejects if the platform refuses the end. That reaches the lifecycle's
-    // 'error' listeners (scheduleStop catches it) and the process shutdown path
-    // logs it, which is where a session we could not close belongs — silence
-    // here is a session running on the platform that nobody knows about. A
-    // session kept after a connect timeout is `session`, so it ends here too.
-    await releaseAll({ endSession: true })
+    // The starts this stop overtook while they were still opening, taken before
+    // anything is awaited: not a start that arrives while the end below is in
+    // flight, which belongs to whoever made it.
+    const overtaken = [...opening].map((turn) => turn.passed)
+    try {
+      // Rejects if the platform refuses the end. That reaches the lifecycle's
+      // 'error' listeners (scheduleStop catches it) and the process shutdown path
+      // logs it, which is where a session we could not close belongs — silence
+      // here is a session running on the platform that nobody knows about. A
+      // session kept after a connect timeout is `session`, so it ends here too.
+      await releaseAll({ endSession: true })
+    } finally {
+      // Then wait for them, bounded (JOI-BUTTON-SUB-019). The session an
+      // overtaken start's /v2/app/start opens did not exist when the end above
+      // ran, so this stop cannot end it; that start ends it itself when the
+      // answer lands (the check after startGameSession() in startAfter()).
+      // Settling first would leave that to chance — on a deploy the process
+      // exits as soon as this settles (server.mjs). 2 × requestTimeoutMs: one
+      // answer and one end.
+      if (overtaken.length > 0) await settleWithin(Promise.all(overtaken), 2 * opts.requestTimeoutMs)
+    }
   }
 
   /**

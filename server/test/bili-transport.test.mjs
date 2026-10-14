@@ -1802,9 +1802,13 @@ test('a stop() that lands while /v2/app/start is answering ends the session that
       (err) => err,
     )
     await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
-    await rig.transport.stop()
+    // Not awaited before the answer: stop() waits for the start it overtook
+    // (JOI-BUTTON-SUB-019), and that start is waiting on this answer.
+    const stopped = rig.transport.stop()
+    await new Promise((resolve) => setTimeout(resolve, 50))
     assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 0, 'stop() ended a session the platform had not opened yet')
     answer()
+    await stopped
 
     const err = await outcome
     assert.ok(err instanceof OpenPlatformError, 'a start that a stop overtook went on to dial as if someone still held it')
@@ -1877,8 +1881,10 @@ test("a stop() that lands while /v2/app/start is answering for a held session's 
     // The held session has been heartbeated (7003) and ended by the time this
     // arrives: the second /v2/app/start is only sent once that end answered.
     await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 2, 'the second /v2/app/start request')
-    await rig.transport.stop()
+    // Not awaited before the answer, for the reason the case above gives.
+    const stopped = rig.transport.stop()
     answer()
+    await stopped
 
     const err = await outcome
     assert.ok(err instanceof OpenPlatformError, 'the replacement session was dialled after the stop')
@@ -1911,6 +1917,363 @@ test("a stop() that lands while /v2/app/start is answering for a held session's 
     await rig.transport.stop().catch(() => {})
     await rig.close()
     await stalled.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// nobody drops a start that is still opening (JOI-BUTTON-SUB-019)
+//
+// The two cases above have the overtaken start end what its late answer
+// opened. That only works if the start is still running when the answer lands,
+// and on a deploy it is not: the process exits as soon as the source's stop()
+// settles (server.mjs). So stop() now waits for it, bounded. A start that
+// arrived after the stop used to run alongside it instead, and when the old
+// answer landed it took `session` over, closed the new socket and left the new
+// session running for nobody; a new start now waits for it too, bounded, and a
+// stop that lands while it waits cancels it before it has asked for anything.
+// A start that is already dialling is waited for by neither: stop() closes its
+// socket and ends its session itself, and the mid-dial cases above hold that
+// its late timer leaves a later start alone.
+
+/**
+ * A gateway whose FIRST /v2/app/start is held until answer(); every other call
+ * is answered at once. The Nth /v2/app/start opens game-000N, N fixed when the
+ * request arrives.
+ */
+function firstStartHeld() {
+  let answer
+  const held = new Promise((resolve) => {
+    answer = resolve
+  })
+  let starts = 0
+  return {
+    answer: () => answer(),
+    gatewayHandler: async (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      const gameId = `game-000${starts}`
+      if (starts === 1) await held
+      return startAnswer(wssUrl, { gameId })
+    },
+  }
+}
+
+/**
+ * `now` AND timers moved by hand, for the case that times the two bounds
+ * without sitting them out. The gateway and the socket stay real and answer in
+ * real time; nothing in that case needs a transport timer to fire by itself,
+ * and advance() fires whatever came due, earliest first.
+ */
+function heldClock(startIso = '2026-08-01T00:00:00Z') {
+  let nowMs = Date.parse(startIso)
+  let nextId = 1
+  const timers = new Map()
+  const schedule = (fn, ms, everyMs) => {
+    const id = nextId
+    nextId += 1
+    timers.set(id, { fn, at: nowMs + ms, everyMs })
+    return id
+  }
+  return {
+    now: () => new Date(nowMs),
+    advance: (ms) => {
+      const target = nowMs + ms
+      for (;;) {
+        let due = null
+        for (const [id, timer] of timers) {
+          if (timer.at <= target && (due === null || timer.at < due.timer.at)) due = { id, timer }
+        }
+        if (due === null) break
+        nowMs = due.timer.at
+        if (due.timer.everyMs > 0) due.timer.at += due.timer.everyMs
+        else timers.delete(due.id)
+        due.timer.fn()
+      }
+      nowMs = target
+    },
+    setTimeout: (fn, ms) => schedule(fn, ms, 0),
+    clearTimeout: (id) => {
+      timers.delete(id)
+    },
+    setInterval: (fn, ms) => schedule(fn, ms, ms),
+    clearInterval: (id) => {
+      timers.delete(id)
+    },
+  }
+}
+
+test('a stop() that lands while /v2/app/start is answering does not settle until the session that answer opened has been ended', async () => {
+  const gateway = firstStartHeld()
+  const rig = await wiredTransport({ gatewayHandler: gateway.gatewayHandler })
+  try {
+    const outcome = rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
+    let pathsWhenStopSettled = null
+    const stopped = rig.transport.stop().then(() => {
+      pathsWhenStopSettled = rig.gateway.calls.map((call) => call.path)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(
+      pathsWhenStopSettled,
+      null,
+      'stop() settled while the start it overtook was still waiting on its answer',
+    )
+
+    gateway.answer()
+    await stopped
+    // What a deploy needs: by the time stop() settles, and server.mjs exits,
+    // the session the late answer opened has been ended.
+    assert.deepEqual(
+      pathsWhenStopSettled,
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end],
+      'stop() settled before the session the late answer opened was ended',
+    )
+    assert.deepEqual(rig.gateway.callsTo(OPEN_LIVE_PATHS.end)[0].body, {
+      app_id: CREDENTIALS.appId,
+      game_id: 'game-0001',
+    })
+    const err = await outcome
+    assert.ok(err instanceof OpenPlatformError, 'the start that stop overtook went on as if someone still held it')
+    assert.match(err.message, /stopped before \/v2\/app\/start had answered/)
+    assert.equal(rig.connections.length, 0, 'a session nobody holds was dialled')
+  } finally {
+    gateway.answer()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a stop() while /v2/app/start goes unanswered settles inside the request timeout, and finds nothing to end', async () => {
+  const REQUEST_TIMEOUT_MS = 200
+  let release
+  const released = new Promise((resolve) => {
+    release = resolve
+  })
+  const rig = await wiredTransport({
+    gatewayHandler: async (call) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      // Held past the transport's request timeout and only let go when the
+      // case is over, long after the transport has stopped listening for it.
+      await released
+      return { status: 503, json: { code: -1, message: 'released by the test' } }
+    },
+    transport: { requestTimeoutMs: REQUEST_TIMEOUT_MS },
+  })
+  try {
+    const outcome = rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
+    const stopCalledAt = Date.now()
+    await rig.transport.stop()
+    const tookMs = Date.now() - stopCalledAt
+    assert.ok(
+      tookMs < REQUEST_TIMEOUT_MS + 1_000,
+      `stop() took ${tookMs}ms with a ${REQUEST_TIMEOUT_MS}ms request timeout: it waited on an answer that was never coming`,
+    )
+
+    const err = await outcome
+    assert.ok(err instanceof OpenPlatformError)
+    assert.match(err.message, /\/v2\/app\/start did not complete/)
+    // The platform never answered, so it never opened a session: nothing to end.
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 0)
+    const state = rig.transport.state()
+    assert.equal(state.hasSession, false)
+    assert.equal(state.consecutiveStartFailures, 0, 'a start the stop overtook was counted as a failure')
+    assert.equal(state.nextDialInMs, 0)
+  } finally {
+    release()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a start that arrives while a stopped start is still being answered waits for it, and that start ends only its own session', async () => {
+  const gateway = firstStartHeld()
+  const rig = await wiredTransport({ gatewayHandler: gateway.gatewayHandler })
+  const heard = []
+  const disconnects = []
+  try {
+    const overtaken = rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the first /v2/app/start request')
+    const stopped = rig.transport.stop()
+    const next = rig.transport.start({
+      onDanmaku: (d) => heard.push(d),
+      onDisconnect: (info) => disconnects.push(info),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length,
+      1,
+      'the next start asked for a session while the stopped one was still being answered',
+    )
+
+    gateway.answer()
+    await next
+    await stopped
+    const err = await overtaken
+    assert.ok(err instanceof OpenPlatformError)
+    assert.match(err.message, /stopped before \/v2\/app\/start had answered/)
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end, OPEN_LIVE_PATHS.start],
+    )
+    assert.deepEqual(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.end).map((call) => call.body),
+      [{ app_id: CREDENTIALS.appId, game_id: 'game-0001' }],
+      'the stopped start ended something other than the session its own answer opened',
+    )
+
+    // A moment later the next start is still listening: the stopped start's
+    // clean-up did not close its socket, and nothing reported a drop.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(rig.connections.length, 1)
+    const state = rig.transport.state()
+    assert.equal(state.authenticated, true, "the stopped start's clean-up closed the next start's socket")
+    assert.equal(state.hasSession, true, "the stopped start's clean-up dropped the next start's session")
+    assert.deepEqual(disconnects, [])
+    rig.connections[0].send(danmakuPacket({ openId: 'open-next', uname: 'Next', msg: 'JOI-NEXT' }))
+    await until(() => heard.length === 1, "a danmaku on the next start's socket")
+  } finally {
+    gateway.answer()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a start still waiting on a stopped start is cancelled by a stop of its own before it asks for anything: not counted, no backoff', async () => {
+  const gateway = firstStartHeld()
+  const rig = await wiredTransport({ gatewayHandler: gateway.gatewayHandler })
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {} }
+  try {
+    const overtaken = rig.transport.start(handlers).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
+    const firstStop = rig.transport.stop()
+    const waiting = rig.transport.start(handlers).then(
+      () => null,
+      (err) => err,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length, 1)
+    const secondStop = rig.transport.stop()
+    gateway.answer()
+    await Promise.all([firstStop, secondStop])
+
+    const err = await waiting
+    assert.ok(err instanceof OpenPlatformError, 'a start that a stop overtook while it waited went on to dial')
+    assert.match(err.message, /stopped while an earlier start was settling/)
+    assert.match(err.message, /not dialling/)
+    assert.notEqual(err.retryable, true, 'a start nobody is waiting for asked to be retried')
+    assert.equal(err.retryAfterMs, undefined)
+    assert.deepEqual(
+      rig.gateway.calls.map((call) => call.path),
+      [OPEN_LIVE_PATHS.start, OPEN_LIVE_PATHS.end],
+      'the cancelled start asked for a session nobody is waiting for',
+    )
+    assert.match((await overtaken).message, /stopped before \/v2\/app\/start had answered/)
+    const state = rig.transport.state()
+    // Cancelled, so it says nothing about the room: not counted, and no
+    // backoff for the next visitor to run into.
+    assert.equal(state.consecutiveStartFailures, 0)
+    assert.equal(state.nextDialInMs, 0)
+    assert.equal(state.hasSession, false)
+    assert.equal(rig.connections.length, 0)
+  } finally {
+    gateway.answer()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('stop() and the next start wait on an opening start only up to their bounds: 2 × and 1 × requestTimeoutMs', async () => {
+  // On the held clock. The requests this case lets through answer in
+  // milliseconds, and the one it holds it lets go itself, so the transport's
+  // real-time request timeout never comes into it.
+  const REQUEST_TIMEOUT_MS = 60_000
+  let release
+  const released = new Promise((resolve) => {
+    release = resolve
+  })
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: async (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      if (starts > 1) return startAnswer(wssUrl, { gameId: `game-000${starts}` })
+      await released
+      // Refused rather than answered with a session: a late answer that opened
+      // one is the residual path start() documents, and this case is about the
+      // bounds.
+      return { status: 503, json: { code: -1, message: 'released by the test' } }
+    },
+    transport: { requestTimeoutMs: REQUEST_TIMEOUT_MS },
+  })
+  const clock = heldClock()
+  const transport = createBiliTransport({ ...rig.config, clock })
+  const aMoment = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const heard = []
+  try {
+    const overtaken = transport.start({ onDanmaku: () => {}, onDisconnect: () => {} }).then(
+      () => null,
+      (err) => err,
+    )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length === 1, 'the /v2/app/start request')
+
+    let stopSettled = false
+    const stopped = transport.stop().then(() => {
+      stopSettled = true
+    })
+    await aMoment() // stop()'s bound is armed once its own end has been dealt with
+    clock.advance(2 * REQUEST_TIMEOUT_MS - 1)
+    await aMoment()
+    assert.equal(stopSettled, false, 'stop() gave up on the start it overtook before its bound')
+    clock.advance(1)
+    await until(() => stopSettled, 'stop() to give up at 2 × requestTimeoutMs')
+    await stopped
+
+    const next = transport.start({ onDanmaku: (d) => heard.push(d), onDisconnect: () => {} })
+    await aMoment()
+    clock.advance(REQUEST_TIMEOUT_MS - 1)
+    await aMoment()
+    assert.equal(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length,
+      1,
+      'the next start stopped waiting before its bound',
+    )
+    clock.advance(1)
+    await until(() => transport.state().authenticated, 'the next start to dial once its bound ran out')
+    await next
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length, 2)
+
+    // The held request finally comes back, refused. The start it belonged to
+    // was stopped, so it is not counted, and its clean-up leaves the next
+    // start's socket and session alone.
+    release()
+    const err = await overtaken
+    assert.ok(err instanceof OpenPlatformError)
+    assert.match(err.message, /answered HTTP 503/)
+    await aMoment()
+    const state = transport.state()
+    assert.equal(state.authenticated, true)
+    assert.equal(state.hasSession, true)
+    assert.equal(state.consecutiveStartFailures, 0)
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 0)
+    rig.connections[0].send(danmakuPacket({ openId: 'open-next', uname: 'Next', msg: 'JOI-NEXT' }))
+    await until(() => heard.length === 1, "a danmaku on the next start's socket")
+  } finally {
+    release()
+    await transport.stop().catch(() => {})
+    await rig.close()
   }
 })
 
