@@ -42,6 +42,13 @@ concurrency:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # The two image repositories (no tag) this run pushes to, exactly as the
+    # meta step computed them. deploy-to-prod reads them from here instead of
+    # computing its own. Actions withholds a job output that contains a secret
+    # value; deploy-to-prod refuses an empty one before anything reaches ssh.
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      api_image: ${{ steps.meta.outputs.api_image }}
     steps:
       # NOTE ON ACTION PINNING (stated rather than left silent):
       # every third-party action below is pinned to a major version tag, which
@@ -76,10 +83,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GHCR rejects uppercase characters in an image path. The owner is
-          # `ryanlan-new` today, which is already lowercase — but lowercasing is
-          # computed instead of hand-waved, so a future rename or transfer to a
-          # mixed-case account cannot turn this into a confusing push failure.
+          # GHCR rejects uppercase characters in an image path, and the owner is
+          # whichever account holds the repository when this runs — it has moved
+          # once already. Lowercasing is computed instead of hand-waved, so a
+          # rename or transfer to a mixed-case account cannot turn this into a
+          # confusing push failure.
+          #
+          # This step is the ONLY place the image paths are computed. They leave
+          # this job as its outputs (image, api_image), and deploy-to-prod deploys
+          # from exactly those, so a deploy pulls what this run pushed — not a
+          # default written into the deploy scripts or the node's deploy.env.
           owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner}/joi-button/web"
           api_image="ghcr.io/${owner}/joi-button/api"
@@ -252,10 +265,11 @@ jobs:
             echo
             echo "Deploy this exact PAIR with the repository's own entrypoint —"
             echo "\`TAG=\` is required, because the script's own default (\`dev-<sha>\`)"
-            echo "names LOCALLY built images, not these. One tag pins both:"
+            echo "names LOCALLY built images, not these. One tag pins both, and"
+            echo "\`IMAGE_REPO\`/\`API_IMAGE_REPO\` name the repositories this run pushed to:"
             echo
             echo '```bash'
-            echo "ALLOW_REGISTRY_PULL=1 TAG=${SHORT_SHA} deploy/deploy-k3s.sh apply"
+            echo "ALLOW_REGISTRY_PULL=1 IMAGE_REPO=${IMAGE} API_IMAGE_REPO=${API_IMAGE} TAG=${SHORT_SHA} deploy/deploy-k3s.sh apply"
             echo '```'
             echo
             echo "Or paste them into the k8s Deployments over the \`replace-me\` placeholders:"
@@ -286,7 +300,12 @@ jobs:
   # Runs ONLY on a `v*.*.*` tag push, and ONLY after build-and-push has published
   # both images for that tag. A push to main builds images but never deploys —
   # tags deploy them. It ssh's to the node, checks out the tag (so the deploy
-  # scripts match the version), and applies from the registry pinned to this tag.
+  # scripts match the version), and applies from the registry pinned to this tag
+  # AND to the two repositories build-and-push pushed it to: its job outputs,
+  # passed as IMAGE_REPO / API_IMAGE_REPO, which deploy-k3s.sh takes over its own
+  # defaults and the node's deploy.env. A repository rename or transfer moves the
+  # deploy along with the push, instead of leaving it on a path that no longer
+  # receives images.
   #
   # SECRETS IT NEEDS (repo Settings → Secrets and variables → Actions):
   #   PROD_SSH_KEY      private key of a deploy keypair whose PUBLIC key is in the
@@ -312,6 +331,9 @@ jobs:
           SSH_USER: ${{ secrets.PROD_SSH_USER }}
           KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
           DEPLOY_TAG: ${{ github.ref_name }}
+          # Computed once, in build-and-push's meta step; never recomputed here.
+          IMAGE_REPO: ${{ needs.build-and-push.outputs.image }}
+          API_IMAGE_REPO: ${{ needs.build-and-push.outputs.api_image }}
         run: |
           set -euo pipefail
 
@@ -321,6 +343,25 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) : ;;
             *) echo "::error::refusing to deploy non-version tag '$DEPLOY_TAG'"; exit 1 ;;
           esac
+          # IMAGE_REPO and API_IMAGE_REPO land in the same remote command, so
+          # accept only ghcr.io/<owner>/joi-button/<web|api>, where <owner> is
+          # lowercase letters, digits and inner hyphens. An empty value (a job
+          # output Actions withheld) is refused here too, before anything is sent.
+          check_repo() {  # <variable name> <value> <web|api>
+            owner="${2#ghcr.io/}"
+            owner="${owner%/joi-button/"$3"}"
+            case "$2" in
+              ghcr.io/*/joi-button/"$3") : ;;
+              *) owner="" ;;
+            esac
+            case "$owner" in
+              ""|-*|*-|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+                echo "::error::refusing to deploy from $1 '$2': expected ghcr.io/<owner>/joi-button/$3"
+                exit 1 ;;
+            esac
+          }
+          check_repo IMAGE_REPO "${IMAGE_REPO:-}" web
+          check_repo API_IMAGE_REPO "${API_IMAGE_REPO:-}" api
           : "${SSH_KEY:?PROD_SSH_KEY secret is not set}"
           : "${SSH_HOST:?PROD_SSH_HOST secret is not set}"
           : "${SSH_USER:?PROD_SSH_USER secret is not set}"
@@ -335,8 +376,11 @@ jobs:
           fi
 
           echo "Deploying ${DEPLOY_TAG} to ${SSH_HOST} ..."
-          # DEPLOY_TAG is validated above; it is expanded here (client side) on purpose.
+          echo "Images: ${IMAGE_REPO}:${DEPLOY_TAG} ${API_IMAGE_REPO}:${DEPLOY_TAG}"
+          # DEPLOY_TAG, IMAGE_REPO and API_IMAGE_REPO are validated above. They are
+          # expanded here (client side) on purpose, each single-quoted for the
+          # remote shell, and handed to deploy-k3s.sh as its environment.
           # shellcheck disable=SC2029,SC2086
           ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes $host_check "${SSH_USER}@${SSH_HOST}" \
-            "set -e; cd ~/joi-button; git fetch --quiet --tags --force origin; git -c advice.detachedHead=false checkout --quiet --force 'refs/tags/${DEPLOY_TAG}'; IMAGE_SOURCE=registry TAG='${DEPLOY_TAG}' bash deploy/deploy-k3s.sh apply"
+            "set -e; cd ~/joi-button; git fetch --quiet --tags --force origin; git -c advice.detachedHead=false checkout --quiet --force 'refs/tags/${DEPLOY_TAG}'; IMAGE_SOURCE=registry TAG='${DEPLOY_TAG}' IMAGE_REPO='${IMAGE_REPO}' API_IMAGE_REPO='${API_IMAGE_REPO}' bash deploy/deploy-k3s.sh apply"
           echo "Deployed ${DEPLOY_TAG}."
