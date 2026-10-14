@@ -193,7 +193,9 @@ fail() {
 # it is not. Every kubectl/ctr call in the apply path goes through these two, so
 # the SAME code drives a remote node and this machine. `-n` on the ssh form keeps
 # it from swallowing our stdin; the piping form deliberately lets stdin through.
-node_exec() { if [[ -n "${REMOTE}" ]]; then node_exec "$1"; else bash -c "$1"; fi; }
+# node_exec must reach ssh, not itself: a self-call here recurses until bash
+# crashes (exit 139) whenever REMOTE is set. test/deploy-k3s.test.mjs holds it.
+node_exec() { if [[ -n "${REMOTE}" ]]; then ssh -n "${REMOTE}" "$1"; else bash -c "$1"; fi; }
 node_pipe() { if [[ -n "${REMOTE}" ]]; then ssh    "${REMOTE}" "$1"; else bash -c "$1"; fi; }
 
 usage() {

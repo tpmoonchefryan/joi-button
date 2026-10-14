@@ -70,15 +70,20 @@ echo "tripwire: the real '$name' must never be reached from test/deploy-k3s.test
 exit 97
 `
 
-// sudo answers exactly one call, the default PULL_CMD (`sudo -n k3s crictl pull
-// <ref>`), as a pull that succeeds unless the ref is STUB_PULL_FAIL. Anything
-// else is a tripwire. The real sudo is never reached.
+// sudo answers exactly two calls: the default PULL_CMD (`sudo -n k3s crictl pull
+// <ref>`), as a pull that succeeds unless the ref is STUB_PULL_FAIL, and the
+// local-build path's `sudo k3s ctr images ls -q`, listing STUB_LOCAL_IMAGES.
+// Anything else is a tripwire. The real sudo is never reached.
 const FAKE_SUDO = String.raw`#!/usr/bin/env bash
 ${LOG_FN}
 log_event sudo "$@"
 if [ "$#" = 5 ] && [ "$1" = -n ] && [ "$2" = k3s ] && [ "$3" = crictl ] && [ "$4" = pull ]; then
   if [ "$5" = "$STUB_PULL_FAIL" ]; then echo "fake crictl: pulling image $5: not found" >&2; exit 1; fi
   echo "Image is up to date for $5"
+  exit 0
+fi
+if [ "$*" = "k3s ctr images ls -q" ]; then
+  for ref in $STUB_LOCAL_IMAGES; do echo "$ref"; done
   exit 0
 fi
 echo "tripwire: 'sudo $*' is not a call this test expects; the real sudo is never reached" >&2
@@ -545,4 +550,104 @@ test('STORY-119 SUB-008: PREPULL and PULL_CMD are in the Optional list the scrip
   assert.match(run.stdout, /^\s+PREPULL\s+default 1\b/m)
   assert.match(run.stdout, /^\s+PULL_CMD\s+default "sudo -n k3s crictl pull"/m)
   assert.deepEqual(run.events, [], 'help reached a stub')
+})
+
+// ---------------------------------------------------------------------------
+// SUB-009: with REMOTE set, node_exec reaches the node over `ssh -n`
+// ---------------------------------------------------------------------------
+
+// The two one-line definitions, exactly as the script has them.
+function nodeFunctions() {
+  const lines = readFileSync(SCRIPT, 'utf8')
+    .split('\n')
+    .filter((l) => /^node_(exec|pipe)\(\) \{.*\}$/.test(l))
+  assert.equal(lines.length, 2, 'node_exec and node_pipe are no longer one-line definitions; update this harness')
+  return lines.join('\n')
+}
+
+test('STORY-119 SUB-009: node_exec makes exactly one `ssh -n <REMOTE> <command>` call; node_pipe keeps stdin and no -n; empty REMOTE stays local', (t) => {
+  const box = sandbox(t)
+  const harness = (remote) =>
+    spawnSync(
+      'bash',
+      ['-c', 'set -euo pipefail; eval "$NODE_FUNCTIONS"; node_exec "printf exec-ran"; printf "pipe-payload\\n" | node_pipe "cat"'],
+      {
+        cwd: box.root,
+        env: {
+          PATH: `${box.bin}:${process.env.PATH}`,
+          HOME: box.home,
+          STUB_STATE_DIR: box.state,
+          FAKE_SSH_HOST: FAKE_NODE,
+          FAKE_SSH_MODE: 'record',
+          REMOTE: remote,
+          NODE_FUNCTIONS: nodeFunctions(),
+        },
+        encoding: 'utf8',
+        timeout: 60_000,
+      },
+    )
+
+  const remote = harness(FAKE_NODE)
+  const remoteDescribe = `exit ${remote.status} signal ${remote.signal}\n${remote.stdout}\n${remote.stderr}`
+  assert.equal(remote.status, 0, remoteDescribe)
+  assert.deepEqual(
+    parseEvents(box.state),
+    [
+      { who: 'ssh', argv: ['-n', FAKE_NODE, 'printf exec-ran'] },
+      { who: 'ssh', argv: [FAKE_NODE, 'cat'] },
+    ],
+    remoteDescribe,
+  )
+  assert.equal(readFileSync(join(box.state, 'ssh-stdin.txt'), 'utf8'), 'pipe-payload\n')
+
+  const local = harness('')
+  assert.equal(local.status, 0, local.stderr)
+  assert.equal(local.stdout, 'exec-ranpipe-payload\n')
+  assert.equal(parseEvents(box.state).length, 2, 'an empty REMOTE went over ssh')
+})
+
+test('STORY-119 SUB-009: with REMOTE set in deploy.env, apply goes through ssh and completes the registry flow', (t) => {
+  const run = runDeploy(t, {
+    deployEnv: `REMOTE=${FAKE_NODE}\nAPP_HOST=app.example.test\n`,
+    env: { FAKE_SSH_MODE: 'run' },
+  })
+  assert.equal(run.signal, null, run.describe())
+  assert.equal(run.status, 0, run.describe())
+  assertPinned(run, WEB_REF, API_REF)
+  assert.deepEqual(callsOf(run, 'pull'), [[API_REF], [WEB_REF]])
+  assertNoOutsideParty(run)
+
+  const ssh = callsOf(run, 'ssh')
+  assert.deepEqual(ssh[0], ['-n', FAKE_NODE, `${run.box.kubectl} get nodes -o name`])
+  for (const argv of ssh) {
+    const piped = argv.at(-1).endsWith('apply -f -')
+    // node_pipe carries a stream on stdin and must not pass -n; everything else
+    // is node_exec, which must.
+    assert.deepEqual(argv.slice(0, -1), piped ? [FAKE_NODE] : ['-n', FAKE_NODE], argv.join(' '))
+  }
+  assert.equal(ssh.filter((argv) => argv[0] !== '-n').length, 3, 'namespace, runtime Secret and workloads are piped')
+})
+
+test('STORY-119 SUB-008: IMAGE_SOURCE=local keeps the node image-store check and does not pre-pull', (t) => {
+  const local = (images) =>
+    runDeploy(t, {
+      deployEnv: `REMOTE=${FAKE_NODE}\nAPP_HOST=app.example.test\n`,
+      env: { IMAGE_SOURCE: 'local', FAKE_SSH_MODE: 'run', STUB_LOCAL_IMAGES: images.join(' ') },
+    })
+  const lsCalls = (run) => callsOf(run, 'sudo').filter((argv) => argv.join(' ') === 'k3s ctr images ls -q')
+  const pulls = (run) => [...callsOf(run, 'pull'), ...callsOf(run, 'sudo').filter((argv) => argv.includes('pull'))]
+
+  const present = local([WEB_REF, API_REF])
+  assert.equal(present.status, 0, present.describe())
+  assert.equal(lsCalls(present).length, 2, 'one image-store check per image')
+  assert.deepEqual(pulls(present), [], 'the local-build path pre-pulled')
+  assertPinned(present, WEB_REF, API_REF)
+  assertNoOutsideParty(present)
+
+  const missing = local([WEB_REF])
+  assert.notEqual(missing.status, 0, missing.describe())
+  assert.match(missing.stderr, new RegExp(`${escapeRe(API_REF)} is not in ${escapeRe(FAKE_NODE)}'s image store`))
+  assert.deepEqual(pulls(missing), [])
+  assert.deepEqual(missing.applied, [])
+  assertNoOutsideParty(missing)
 })
