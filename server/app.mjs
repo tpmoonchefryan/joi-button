@@ -103,6 +103,12 @@
 //     the url through whole — the "the poll token is on no line at all" and
 //     "every request line keeps method and path and loses the query string"
 //     cases go red.
+//   * Stop subscribing to the danmaku source's 'error' event — the "a danmaku
+//     the source cannot read is logged" case goes red; log what it emits as it
+//     is instead of through sourceErrorLogFields — the "named fields only"
+//     case goes red.
+//   * Drop the unsubscribe from the onClose hook — the "a closed app writes no
+//     more source errors" case goes red.
 // ---------------------------------------------------------------------------
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
@@ -325,6 +331,26 @@ export function createApp({
   app.decorate('storageGuard', storageGuard)
   app.decorate('sessionCookie', sessionCookie)
   app.decorate('guardReport', report)
+
+  // The room source's 'error' event, written down (JOI-BUTTON-STORY-120). It is
+  // where the source sends every failure it has nobody to return to — a frame
+  // it could not read, a heartbeat that threw, a session it could not end, a
+  // listener that threw — and until this subscription nothing listened, so none
+  // of them reached the log; at most a counter moved. 'danmaku' is in the
+  // message for the reason routes/public.mjs gives for its dial lines: the
+  // operator's check is `kubectl logs … | grep danmaku`.
+  //
+  // Through sourceErrorLogFields() and nothing else, because the payload can be
+  // anything a listener threw. Here and not in server.mjs, because server.mjs
+  // hands this function the very source it runs and only this side has a test
+  // seam. The subscription leaves on close; the source does not stop — it is
+  // not this file's to stop (see the header).
+  const unsubscribeSourceErrors = danmaku.on('error', (error) => {
+    app.log.error({ err: sourceErrorLogFields(error) }, 'danmaku source error')
+  })
+  app.addHook('onClose', async () => {
+    unsubscribeSourceErrors()
+  })
 
   if (devSession !== null) {
     app.addHook('onRequest', async (request, reply) => {
@@ -856,4 +882,39 @@ export function requestLogValue(req) {
     remoteAddress: req.ip,
     remotePort: req.socket ? req.socket.remotePort : undefined,
   }
+}
+
+/**
+ * What of a danmaku source error may reach the "danmaku source error" line
+ * (JOI-BUTTON-STORY-120).
+ *
+ * The payload is whatever failed, and that includes whatever a listener threw:
+ * the source hands a listener's exception to 'error' rather than let it escape.
+ * Given that value as it is, pino's err serializer copies every enumerable
+ * field it carries, nested objects included, so an error that happened to hold
+ * an auth body or a visitor's code would write it out. Nothing is spread here.
+ * A value with a string message gives up name, message and stack as strings,
+ * and three of the fields OpenPlatformError adds — endpoint as a string, status
+ * and platformCode as finite numbers — and nothing else: not code, not cause,
+ * not dial. Any other value is recorded as its type alone.
+ *
+ * The message is not filtered, because carrying it is the line's whole job.
+ * What goes into it is the thrower's business; bili-transport.mjs's errors
+ * carry a path, an HTTP status and the platform's own text, never a request
+ * body. pino recomputes `type` from the constructor of what it is handed, a
+ * plain object here, so it is `name` that carries the error's class.
+ *
+ * Exported for the case that feeds it a poisoned error; the subscription in
+ * createApp is its only caller.
+ */
+export function sourceErrorLogFields(value) {
+  if (typeof value?.message !== 'string') return { type: typeof value }
+  const fields = {}
+  for (const name of ['name', 'message', 'stack', 'endpoint']) {
+    if (typeof value[name] === 'string') fields[name] = value[name]
+  }
+  for (const name of ['status', 'platformCode']) {
+    if (Number.isFinite(value[name])) fields[name] = value[name]
+  }
+  return fields
 }

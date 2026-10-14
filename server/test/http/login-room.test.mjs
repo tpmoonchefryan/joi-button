@@ -15,7 +15,8 @@ import test from 'node:test'
 
 import Fastify from 'fastify'
 
-import { requestLogValue } from '../../app.mjs'
+import { requestLogValue, sourceErrorLogFields } from '../../app.mjs'
+import { OpenPlatformError } from '../../lib/bili-transport.mjs'
 import { LOGIN_STATES, dialLogFields } from '../../routes/public.mjs'
 import { VISITOR, boot, captureLog, cookieOf, get } from './harness.mjs'
 
@@ -273,6 +274,7 @@ const DIAL_KEYS = Object.freeze(['attempt', 'elapsedMs', 'host', 'outcome', 'pha
 // pino's numeric levels, which is what lands in the line.
 const INFO = 30
 const WARN = 40
+const ERROR = 50
 // Everything pino puts on a line by itself, plus the two fields the final warn
 // is allowed to add. Anything else at the top level is something the route
 // chose to log, and nothing else was chosen.
@@ -508,4 +510,134 @@ test('requestLogValue is fastify\'s request value with the url cut at its first 
 
   // A url that is not a string is passed on as it came, as fastify's would be.
   assert.equal(requestLogValue({ method: 'GET', headers: {} }).url, undefined)
+})
+
+// The source's own errors (JOI-BUTTON-STORY-120). What the source cannot hand
+// back to a caller — a frame it could not read, a listener that threw — goes to
+// its 'error' event, and createApp writes each one as a "danmaku source error"
+// line, through sourceErrorLogFields so that only named fields reach it.
+
+// Everything pino puts on a line by itself, plus err; and within err, pino's
+// own `type` plus the six names sourceErrorLogFields copies.
+const SOURCE_ERROR_KEYS = new Set(['level', 'time', 'pid', 'hostname', 'msg', 'err'])
+const SOURCE_ERROR_ERR_KEYS = new Set(['type', 'name', 'message', 'stack', 'endpoint', 'status', 'platformCode'])
+
+const sourceErrorLines = (log) => linesSaying(log, 'danmaku source error')
+
+test('a danmaku the source cannot read is logged: exactly one error line, "danmaku source error", saying what was wrong', async (t) => {
+  const log = captureLog()
+  const { clock, danmaku } = await boot(t, { logger: log.logger })
+  const lease = danmaku.acquire()
+  await clock.advance(1)
+  const { leaseId } = await lease
+
+  // No open_id: normalizeDanmaku refuses it, and the source sends the refusal
+  // to 'error' — there is no caller to return it to.
+  danmaku.control.emitDanmaku({ openId: '', text: 'x' })
+  danmaku.release(leaseId)
+  assert.equal(danmaku.status().events.malformed, 1, 'the source never refused the danmaku, so the line below proves nothing')
+
+  const lines = sourceErrorLines(log)
+  assert.equal(lines.length, 1, 'the source\'s error was not logged exactly once')
+  assert.equal(lines[0].level, ERROR)
+  assert.match(lines[0].err.message, /open_id is missing/)
+})
+
+test('a source error reaches the log as named fields only, whatever the thrown value carried beside them', async (t) => {
+  const log = captureLog()
+  const { clock, danmaku } = await boot(t, { logger: log.logger })
+  const lease = danmaku.acquire()
+  await clock.advance(1)
+  const { leaseId } = await lease
+
+  // A listener that throws an error dressed in everything a log must never
+  // carry. The source hands a listener's exception to 'error' rather than let
+  // it escape, so this is a payload the subscription really can be given.
+  const poisoned = Object.assign(new Error('a danmaku listener failed'), {
+    authBody: 'secret-auth-body',
+    auth_body: 'secret-auth_body',
+    accessKeySecret: 'secret-access-key',
+    pollToken: 'secret-poll-token',
+    code: 'secret-identity-code',
+    cause: { auth_body: 'secret-nested' },
+    dial: { auth_body: 'secret-dial' },
+  })
+  const unsubscribe = danmaku.on('danmaku', () => {
+    throw poisoned
+  })
+  danmaku.control.emitDanmaku({ openId: VISITOR.openId, displayName: VISITOR.displayName, text: 'hello' })
+  unsubscribe()
+  danmaku.release(leaseId)
+
+  const lines = sourceErrorLines(log)
+  assert.equal(lines.length, 1, 'the listener\'s exception was not logged exactly once')
+  const [line] = lines
+  assert.equal(line.level, ERROR)
+  assert.equal(line.err.message, 'a danmaku listener failed')
+  assert.doesNotMatch(JSON.stringify(line), /secret/)
+  const errExtra = Object.keys(line.err).filter((key) => !SOURCE_ERROR_ERR_KEYS.has(key))
+  assert.deepEqual(errExtra, [], 'err carries fields beyond the named ones')
+  const extra = Object.keys(line).filter((key) => !SOURCE_ERROR_KEYS.has(key))
+  assert.deepEqual(extra, [], 'the line carries fields beyond err')
+  // pino's own `type` names the plain object it was handed; `name` is what
+  // carries the class.
+  assert.equal(line.err.name, 'Error')
+})
+
+test('a closed app writes no more source errors: the subscription leaves with the app', async (t) => {
+  const log = captureLog()
+  const { app, clock, danmaku } = await boot(t, { logger: log.logger })
+  const logged = () => sourceErrorLines(log).length
+  const lease = danmaku.acquire()
+  await clock.advance(1)
+  const { leaseId } = await lease
+
+  // Live first, so that the silence below means something: an error the
+  // source raises while the app is up does reach the log.
+  danmaku.control.emitDanmaku({ openId: '', text: 'x' })
+  assert.equal(logged(), 1, 'the subscription was never live, so its removal would prove nothing')
+
+  await app.close()
+
+  // The source is not the app's, so it is still listening on this lease.
+  danmaku.control.emitDanmaku({ openId: '', text: 'x' })
+  danmaku.release(leaseId)
+  assert.equal(danmaku.status().events.malformed, 2, 'the source never errored again, so the silence proves nothing')
+  assert.equal(logged(), 1, 'a closed app went on logging the source\'s errors')
+})
+
+test('sourceErrorLogFields copies six named fields, each only as the type it should be, and of anything else only its type', () => {
+  const failure = new OpenPlatformError('bili gateway: POST /v2/app/start answered with platform code 7001', {
+    endpoint: '/v2/app/start',
+    status: 200,
+    platformCode: 7001,
+    requestId: 'gateway-request-1',
+  })
+  assert.deepEqual(sourceErrorLogFields(Object.assign(failure, { auth_body: 'secret-auth-body' })), {
+    name: 'OpenPlatformError',
+    message: 'bili gateway: POST /v2/app/start answered with platform code 7001',
+    stack: failure.stack,
+    endpoint: '/v2/app/start',
+    status: 200,
+    platformCode: 7001,
+  })
+
+  // Copied by name is not enough on its own: a value of the wrong kind under an
+  // allowed name would carry its contents straight past the list.
+  const disguised = sourceErrorLogFields({
+    message: 'disguised',
+    name: { auth_body: 'secret-name' },
+    stack: ['secret-stack'],
+    endpoint: { auth_body: 'secret-endpoint' },
+    status: '500 secret-status',
+    platformCode: Number.NaN,
+  })
+  assert.deepEqual(disguised, { message: 'disguised' })
+
+  // Anything without a string message — a thrown string, nothing at all, an
+  // object that only looks like trouble — is recorded as its type and no more.
+  assert.deepEqual(sourceErrorLogFields('secret-thrown-string'), { type: 'string' })
+  assert.deepEqual(sourceErrorLogFields(undefined), { type: 'undefined' })
+  assert.deepEqual(sourceErrorLogFields(null), { type: 'object' })
+  assert.deepEqual(sourceErrorLogFields({ reason: 'secret-reason', message: 42 }), { type: 'object' })
 })
