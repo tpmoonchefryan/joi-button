@@ -322,7 +322,14 @@ jobs:
   #
   # THE NODE must let that user run kubectl NON-interactively (a sudo password
   # prompt has nowhere to read from here): either passwordless sudo for k3s, or a
-  # readable kubeconfig plus `KUBECTL=kubectl` in deploy/deploy.env.
+  # readable kubeconfig plus `KUBECTL=kubectl` in deploy/deploy.env. The same
+  # goes for the pre-pull: before it applies anything, deploy-k3s.sh pulls both
+  # images on the node with PULL_CMD, and the default PULL_CMD
+  # (`sudo -n k3s crictl pull`) needs passwordless sudo too. A node that has only
+  # the readable kubeconfig and `KUBECTL=kubectl` must ALSO set PULL_CMD in
+  # deploy/deploy.env, to a command that pulls into that node's image store;
+  # otherwise every tag deploy refuses before it applies anything, and no object
+  # changes.
   # ---------------------------------------------------------------------------
   deploy-to-prod:
     needs: build-and-push
