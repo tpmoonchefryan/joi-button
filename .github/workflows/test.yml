@@ -1,0 +1,113 @@
+name: Root tests
+
+# What this runs, and why it can do nothing else.
+#
+# Among the root tests (test/*.test.mjs) are the ones that drive
+# deploy/deploy-k3s.sh and the `run:` blocks of image.yml against test doubles.
+# Until this workflow they had only run on a developer's macOS, under bash 3.2,
+# while the production node runs Ubuntu with bash 5, so the first time the
+# deploy script met bash 5 was a production deploy. This workflow runs every
+# root test on an Ubuntu runner, under bash 5, with Node 22, the major version
+# production runs: on every push to main and on every pull request. It fails
+# when a test fails, and when a test is skipped.
+#
+# It only tests. It builds and publishes nothing, deploys nothing, signs in to
+# nothing and installs nothing: the root tests import only Node's built-in
+# modules and files in this repository, and need neither the network nor a
+# container engine. Publishing and deploying stay in image.yml, behind its own
+# triggers. So the token below can read the source, and that is all.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+# Least privilege: read the source. Nothing else, and no job widens it.
+permissions:
+  contents: read
+
+jobs:
+  root-tests:
+    runs-on: ubuntu-latest
+    # The whole set takes about 20 s; a hung test must not hold a runner for
+    # the default six hours.
+    timeout-minutes: 15
+    steps:
+      # Pinned to major version tags, as in image.yml, whose note on action
+      # pinning states that accepted risk. No other action is used.
+      - uses: actions/checkout@v4
+        with:
+          # Nothing here pushes, so the token is not left behind in .git/config.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # No `npm ci`: the root tests never import node_modules.
+
+      - name: Show the toolchain; require ruby and its YAML and JSON libraries
+        run: |
+          set -euo pipefail
+          bash --version
+          node --version
+          # test/image-workflow.test.mjs and test/deploy-seam.test.mjs read
+          # image.yml with Ruby's YAML parser, and without it they skip every
+          # test that needs it.
+          if ! ruby --version; then
+            echo "::error::ruby is not on PATH; test/image-workflow.test.mjs and test/deploy-seam.test.mjs need it to read image.yml"
+            exit 1
+          fi
+          if ! ruby -ryaml -rjson -e 'exit 0'; then
+            echo "::error::ruby cannot load its yaml and json libraries, which test/image-workflow.test.mjs and test/deploy-seam.test.mjs need to read image.yml"
+            exit 1
+          fi
+
+      - name: Require that node is absent from /usr/bin and /bin
+        run: |
+          set -euo pipefail
+          # test/deploy-seam.test.mjs simulates a bare k3s node, whose PATH is
+          # the test's doubles followed by /usr/bin:/bin, and node must not be
+          # found there: deploy-k3s.sh then takes its no-Node.js branch, as it
+          # does on the production node. setup-node puts Node 22 in the tool
+          # cache, not in /usr/bin. A runner image with a node in /usr/bin or
+          # /bin would make those tests fail while building their node, with an
+          # assertion that does not say why; this step says why first. Do not
+          # skip or weaken those tests to get past it.
+          found="$(env -i PATH=/usr/bin:/bin sh -c 'command -v node' || true)"
+          if [ -n "$found" ]; then
+            echo "::error::node is at $found, on the /usr/bin:/bin PATH that test/deploy-seam.test.mjs gives its simulated bare k3s node, where node must be absent"
+            exit 1
+          fi
+          echo "node is not on /usr/bin:/bin, as test/deploy-seam.test.mjs requires"
+
+      - name: Run the root tests
+        # spec to the log, TAP to a file for the next step. Nothing is piped,
+        # so node's own exit status decides this step: any failing test fails it.
+        run: |
+          node --test \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$RUNNER_TEMP/root-tests.tap" \
+            test/*.test.mjs
+
+      - name: Fail if any root test was skipped
+        # node --test exits 0 when tests are skipped (without ruby, for one,
+        # every test that reads image.yml is), so a green run could hide tests
+        # that never ran. Read the count from the TAP summary line,
+        # `# skipped N`, and fail unless N is 0.
+        run: |
+          set -euo pipefail
+          tap="$RUNNER_TEMP/root-tests.tap"
+          summary="$(grep -E '^# skipped [0-9]+$' "$tap" | tail -n 1 || true)"
+          if [ -z "$summary" ]; then
+            echo "::error::no '# skipped N' summary line in $tap, so whether a root test was skipped is unknown"
+            exit 1
+          fi
+          skipped="${summary##* }"
+          # Compared as text: anything but exactly 0 fails, and nothing here can
+          # make the comparison itself error out and fall through to a pass.
+          if [ "$skipped" != 0 ]; then
+            grep -E '# SKIP' "$tap" || true
+            echo "::error::$skipped root test(s) skipped; every root test must run on this runner"
+            exit 1
+          fi
+          echo "root tests skipped: 0"
