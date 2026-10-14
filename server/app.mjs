@@ -108,7 +108,8 @@
 //     is instead of through sourceErrorLogFields — the "named fields only"
 //     case goes red.
 //   * Drop the unsubscribe from the onClose hook — the "a closed app writes no
-//     more source errors" case goes red.
+//     more source errors" case goes red; subscribe before the routes are
+//     checked — the "refuses its routes leaves no subscription" case goes red.
 // ---------------------------------------------------------------------------
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
@@ -332,26 +333,6 @@ export function createApp({
   app.decorate('sessionCookie', sessionCookie)
   app.decorate('guardReport', report)
 
-  // The room source's 'error' event, written down (JOI-BUTTON-STORY-120). It is
-  // where the source sends every failure it has nobody to return to — a frame
-  // it could not read, a heartbeat that threw, a session it could not end, a
-  // listener that threw — and until this subscription nothing listened, so none
-  // of them reached the log; at most a counter moved. 'danmaku' is in the
-  // message for the reason routes/public.mjs gives for its dial lines: the
-  // operator's check is `kubectl logs … | grep danmaku`.
-  //
-  // Through sourceErrorLogFields() and nothing else, because the payload can be
-  // anything a listener threw. Here and not in server.mjs, because server.mjs
-  // hands this function the very source it runs and only this side has a test
-  // seam. The subscription leaves on close; the source does not stop — it is
-  // not this file's to stop (see the header).
-  const unsubscribeSourceErrors = danmaku.on('error', (error) => {
-    app.log.error({ err: sourceErrorLogFields(error) }, 'danmaku source error')
-  })
-  app.addHook('onClose', async () => {
-    unsubscribeSourceErrors()
-  })
-
   if (devSession !== null) {
     app.addHook('onRequest', async (request, reply) => {
       // Always prefer the local session in this explicitly local-only mode. It
@@ -457,6 +438,28 @@ export function createApp({
       },
       requestId: request.id,
     })
+  })
+
+  // The room source's 'error' event, written down (JOI-BUTTON-STORY-120). It is
+  // where the source sends every failure it has nobody to return to — a frame
+  // it could not read, a heartbeat that threw, a session it could not end, a
+  // listener that threw — and until this subscription nothing listened, so none
+  // of them reached the log; at most a counter moved. 'danmaku' is in the
+  // message for the reason routes/public.mjs gives for its dial lines: the
+  // operator's check is `kubectl logs … | grep danmaku`.
+  //
+  // Through sourceErrorLogFields() and nothing else, because the payload can be
+  // anything a listener threw. Here and not in server.mjs, because server.mjs
+  // hands this function the very source it runs and only this side has a test
+  // seam. Last, after everything above that can throw: a createApp that throws
+  // returns no app to close, and a subscription made before the throw would
+  // outlive it. The subscription leaves on close; the source does not stop — it
+  // is not this file's to stop (see the header).
+  const unsubscribeSourceErrors = danmaku.on('error', (error) => {
+    app.log.error({ err: sourceErrorLogFields(error) }, 'danmaku source error')
+  })
+  app.addHook('onClose', async () => {
+    unsubscribeSourceErrors()
   })
 
   return app

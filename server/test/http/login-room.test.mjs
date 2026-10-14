@@ -15,7 +15,7 @@ import test from 'node:test'
 
 import Fastify from 'fastify'
 
-import { requestLogValue, sourceErrorLogFields } from '../../app.mjs'
+import { createApp, requestLogValue, sourceErrorLogFields } from '../../app.mjs'
 import { OpenPlatformError } from '../../lib/bili-transport.mjs'
 import { LOGIN_STATES, dialLogFields } from '../../routes/public.mjs'
 import { VISITOR, boot, captureLog, cookieOf, get } from './harness.mjs'
@@ -604,6 +604,25 @@ test('a closed app writes no more source errors: the subscription leaves with th
   danmaku.release(leaseId)
   assert.equal(danmaku.status().events.malformed, 2, 'the source never errored again, so the silence proves nothing')
   assert.equal(logged(), 1, 'a closed app went on logging the source\'s errors')
+})
+
+test('a createApp that refuses its routes leaves no subscription behind on the source', async (t) => {
+  const { clock, config, danmaku, db, report, storageGuard } = await boot(t)
+  const log = captureLog()
+  // A throwing createApp returns no app, so nothing could ever close one: a
+  // subscription it made before throwing would outlive it.
+  assert.throws(
+    () => createApp({ config, db, danmaku, storageGuard, logger: log.logger, report, routes: ['not a plugin'] }),
+    /every entry in `routes`/,
+  )
+
+  const lease = danmaku.acquire()
+  await clock.advance(1)
+  const { leaseId } = await lease
+  danmaku.control.emitDanmaku({ openId: '', text: 'x' })
+  danmaku.release(leaseId)
+  assert.equal(danmaku.status().events.malformed, 1, 'the source never errored, so the silence proves nothing')
+  assert.equal(sourceErrorLines(log).length, 0, 'the refused app left its subscription on the source')
 })
 
 test('sourceErrorLogFields copies six named fields, each only as the type it should be, and of anything else only its type', () => {
