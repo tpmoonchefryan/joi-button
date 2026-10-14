@@ -13,8 +13,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { LOGIN_STATES } from '../../routes/public.mjs'
-import { VISITOR, boot, cookieOf, get } from './harness.mjs'
+import { LOGIN_STATES, dialLogFields } from '../../routes/public.mjs'
+import { VISITOR, boot, captureLog, cookieOf, get } from './harness.mjs'
 
 // ---------------------------------------------------------------------------
 // A code cannot exist while we are deaf
@@ -250,4 +250,152 @@ test('cancelling gives the socket back even while the start is still in flight',
   // Without the abandoned check in the acquire continuation this lease is never
   // released and pins the room for its full TTL on behalf of nobody.
   assert.equal(danmaku.status().waiters, 0)
+})
+
+// ---------------------------------------------------------------------------
+// every dial, one log line (JOI-BUTTON-STORY-118)
+//
+// Read through the real logger: captureLog() hands createApp pino options, so
+// fastify builds the pino instance production gets, with production's
+// serializers, and only the destination differs. What these cases read is what
+// a production log line would carry.
+//
+// "Does not carry the poll token" is asserted of the dial lines and the final
+// warn only, never of every line captured: fastify's own request log records
+// GET /api/login/status?token=… with the token in the URL. That is older than
+// this change and outside it; asserting over everything would go red on it.
+
+const DIAL_KEYS = Object.freeze(['attempt', 'elapsedMs', 'host', 'outcome', 'phase'])
+// pino's numeric levels, which is what lands in the line.
+const INFO = 30
+const WARN = 40
+// Everything pino puts on a line by itself, plus the two fields the final warn
+// is allowed to add. Anything else at the top level is something the route
+// chose to log, and nothing else was chosen.
+const FINAL_WARN_KEYS = new Set(['level', 'time', 'pid', 'hostname', 'msg', 'err', 'dial'])
+
+const linesSaying = (log, msg) => log.lines.filter((line) => line.msg === msg)
+
+test('a dial that gets the room listening writes exactly one info line, "danmaku dial succeeded", carrying the five dial fields', async (t) => {
+  const log = captureLog()
+  const { app, clock } = await boot(t, { logger: log.logger })
+
+  const started = await app.inject({ method: 'POST', url: '/api/login/start' })
+  assert.equal(started.statusCode, 200, started.payload)
+  const { pollToken } = started.json()
+  await clock.advance(1)
+
+  const succeeded = linesSaying(log, 'danmaku dial succeeded')
+  assert.equal(succeeded.length, 1, 'the dial that got the room listening was not logged exactly once')
+  const [line] = succeeded
+  assert.equal(line.level, INFO, 'a successful dial was logged below the level production runs at')
+  assert.deepEqual(Object.keys(line.dial).sort(), DIAL_KEYS)
+  assert.equal(line.dial.outcome, 'ok')
+  assert.equal(linesSaying(log, 'danmaku dial failed').length, 0)
+  assert.ok(!JSON.stringify(line).includes(pollToken), 'the dial line carries the visitor\'s poll token')
+})
+
+test('a dial that fails writes a warn line, and "the room session could not be opened" carries err and the same five fields', async (t) => {
+  const log = captureLog()
+  const { app, clock, danmaku } = await boot(t, { logger: log.logger })
+  danmaku.control.setStartBehaviour('fail')
+
+  const started = await app.inject({ method: 'POST', url: '/api/login/start' })
+  const cookie = cookieOf(started)
+  const { pollToken } = started.json()
+  assert.equal(typeof pollToken, 'string')
+  await clock.advance(1)
+
+  // What the visitor is told has not moved; only the log has grown.
+  const told = (await get(app, `/api/login/status?token=${pollToken}`, { cookie })).json()
+  assert.equal(told.state, LOGIN_STATES.ROOM_UNREACHABLE)
+
+  const failed = linesSaying(log, 'danmaku dial failed')
+  assert.equal(failed.length, 1, 'the dial that failed was not logged exactly once')
+  assert.equal(failed[0].level, WARN)
+  assert.deepEqual(Object.keys(failed[0].dial).sort(), DIAL_KEYS)
+  assert.notEqual(failed[0].dial.outcome, 'ok')
+
+  // The message text is the one this warn has always had: it is what an
+  // operator already searches for.
+  const final = linesSaying(log, 'the room session could not be opened')
+  assert.equal(final.length, 1, 'the final warn is missing, or its text has changed')
+  assert.equal(final[0].level, WARN)
+  assert.match(final[0].err.message, /simulated start failure/, 'the final warn lost the error that ended the start')
+  assert.deepEqual(final[0].dial, failed[0].dial, 'the final warn does not name the dial that ended the start')
+
+  for (const line of [...failed, final[0]]) {
+    const text = JSON.stringify(line)
+    assert.ok(!text.includes(pollToken), `"${line.msg}" carries the visitor's poll token`)
+    assert.ok(!/auth_?body/i.test(text), `"${line.msg}" carries an auth body`)
+  }
+  const extra = Object.keys(final[0]).filter((key) => !FINAL_WARN_KEYS.has(key))
+  assert.deepEqual(extra, [], 'the final warn logs fields beyond err and dial')
+})
+
+test('a dial record reaches a log line as five named fields and nothing else, whatever the transport put beside them', () => {
+  // The transport is supposed to build its record from these five. This is the
+  // case for the day it does not: everything below that is not one of the five
+  // is something a log must never carry.
+  const poisoned = {
+    host: 'broadcastlv.chat.bilibili.com:443',
+    phase: 'awaiting-auth-reply',
+    elapsedMs: 30_000,
+    attempt: 2,
+    outcome: 'timeout',
+    auth_body: '{"roomid":3622717,"key":"secret-auth-key"}',
+    accessKeySecret: 'secret-access-key',
+    pollToken: 'secret-poll-token',
+    url: 'wss://broadcastlv.chat.bilibili.com:443/sub?token=secret-url-token',
+  }
+  const fields = dialLogFields(poisoned)
+  assert.deepEqual(fields, {
+    host: 'broadcastlv.chat.bilibili.com:443',
+    phase: 'awaiting-auth-reply',
+    elapsedMs: 30_000,
+    attempt: 2,
+    outcome: 'timeout',
+  })
+  assert.doesNotMatch(JSON.stringify(fields), /secret/)
+
+  // Copied by name is not enough on its own: an object under an allowed name
+  // would carry its contents straight past the whitelist.
+  const nested = dialLogFields({ ...poisoned, host: { name: 'broadcastlv', auth_body: 'secret-nested' } })
+  assert.equal(nested.host, null)
+  assert.doesNotMatch(JSON.stringify(nested), /secret/)
+
+  // Every line has all five keys; a missing one reads null, not absent.
+  assert.deepEqual(dialLogFields({ outcome: 'ok' }), {
+    host: null,
+    phase: null,
+    elapsedMs: null,
+    attempt: null,
+    outcome: 'ok',
+  })
+  assert.equal(dialLogFields(undefined), null)
+  assert.equal(dialLogFields(null), null)
+  assert.equal(dialLogFields('broadcastlv.chat.bilibili.com:443'), null)
+})
+
+test('a closed app writes no more dial lines: the dial subscription leaves with the plugin', async (t) => {
+  const log = captureLog()
+  const { app, clock, danmaku } = await boot(t, { logger: log.logger })
+  const logged = () => linesSaying(log, 'danmaku dial succeeded').length
+
+  // Live first, so that the silence below means something: a dial the source
+  // makes while the app is up does reach the log.
+  const before = danmaku.acquire()
+  await clock.advance(1)
+  danmaku.release((await before).leaseId)
+  await clock.advance(1)
+  assert.equal(logged(), 1, 'the subscription was never live, so its removal would prove nothing')
+
+  await app.close()
+
+  const after = danmaku.acquire()
+  await clock.advance(1)
+  danmaku.release((await after).leaseId)
+  await clock.advance(1)
+  assert.equal(danmaku.control.startCount(), 2, 'the source never dialled again, so the silence proves nothing')
+  assert.equal(logged(), 1, 'a closed app went on logging the source\'s dials')
 })

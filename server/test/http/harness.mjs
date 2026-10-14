@@ -196,12 +196,40 @@ export const anItem = (overrides = {}) => ({
 // The server
 
 /**
+ * captureLog({ level }) -> { logger, lines }
+ *
+ * For boot()'s `logger`: what the server would have logged, as the objects a
+ * production log line is made of.
+ *
+ * pino OPTIONS rather than a hand-rolled logger object, on purpose. server.mjs
+ * passes options too (`logger: { level }`), so fastify builds the same pino
+ * instance with the same serializers — `err` comes out as type, message, stack
+ * and the error's own enumerable fields, exactly as it would in production —
+ * and only the destination differs. A test asserting that a line does not
+ * carry a credential is then asserting it about what production writes, not
+ * about what a stand-in happened to keep. 'info' by default because that is
+ * the level the deployment runs at.
+ */
+export function captureLog({ level = 'info' } = {}) {
+  const lines = []
+  const stream = {
+    write(chunk) {
+      lines.push(JSON.parse(chunk))
+    },
+  }
+  return { logger: { level, stream }, lines }
+}
+
+/**
  * boot(t, options) -> { app, db, clock, danmaku, storageGuard, paths, config, report }
  *
  * Every step is in the order server.mjs puts it in, and the order is the whole
  * point of that file: the guard needs the migrated database (it reads
  * instance.mode out of it), and the development sources need the guard (they
  * refuse to construct from a config it has not cleared).
+ *
+ * `logger` goes to createApp as given; false (the default) logs nothing. Pass
+ * captureLog().logger to read what was logged.
  */
 export async function boot(t, {
   roomId = ROOM_ID,
@@ -210,6 +238,7 @@ export async function boot(t, {
   adminOpenIds = [OWNER.openId],
   devAdminBypass = false,
   storageGuard: suppliedStorageGuard,
+  logger = false,
 } = {}) {
   // 1. the database, stamped 'development' — the mark the guard reads and the
   //    mark schema.sql's bypass triggers consult. It is a one-way ratchet, so a
@@ -291,7 +320,7 @@ export async function boot(t, {
     db,
     danmaku,
     storageGuard,
-    logger: false,
+    logger,
     report,
     devAdminBypass,
     routes: [

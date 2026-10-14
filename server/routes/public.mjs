@@ -148,6 +148,21 @@
 //   * Release leases with a counter instead of by lease id, or skip the onClose
 //     hook — the source's refcount never returns to zero and the socket outlives
 //     the plugin.
+//   * Make dialLogFields() hand back the record, or a spread of it, instead of
+//     copying the five fields by name — red input: the poisoned record the
+//     whitelist case in test/http/login-room.test.mjs feeds it, an auth_body,
+//     an access key and a poll token beside the five fields (JOI-BUTTON-
+//     STORY-118). Calling AROUND it at its two call sites in this file is not
+//     red, and is said here so nobody believes otherwise: the development
+//     double reports exactly the five fields, so a line built from the raw
+//     record reads the same. Those two call sites are checked by eye.
+//   * Put `attempt`, or anything built from it, into the "the room session
+//     could not be opened" warn — attempt.id IS the poll token, the bearer
+//     credential for this visitor's status poll, and the failing-dial case
+//     searches the serialised line for it.
+//   * Skip unsubscribeDial() in onClose — red input: close the app, then let
+//     the source dial once more. The closed plugin still writes the line, and
+//     every app ever built over the same source adds one more copy of it.
 //   * Give the temp file an extension, or pass a mimeType to parseFile — the
 //     parser stops sniffing and believes the name. The assertion in drainFile is
 //     what makes that a crash rather than a silent change of behaviour.
@@ -579,6 +594,23 @@ export default async function publicRoutes(fastify, options = {}) {
     }
   })
 
+  // One line per dial (JOI-BUTTON-STORY-118). A dial that failed and was retried
+  // into success leaves no other trace — the visitor got a code and the source
+  // never left 'starting' — so without this line the failure rate of the one
+  // link the whole login depends on is invisible precisely while the retry is
+  // working. 'danmaku' is in both messages because the operator's check is
+  // `kubectl logs … | grep danmaku`; success goes out at info because production
+  // logs at info, and a success nobody can count is not a measurement.
+  //
+  // Through dialLogFields() and nothing else: five named fields copied out of
+  // the transport's record are the whole of what may reach the line — never
+  // auth_body or any credential, and nothing of the visitor's.
+  const unsubscribeDial = source.on('dial', (record) => {
+    const dial = dialLogFields(record)
+    if (dial?.outcome === 'ok') fastify.log.info({ dial }, 'danmaku dial succeeded')
+    else fastify.log.warn({ dial }, 'danmaku dial failed')
+  })
+
   function onDanmaku(event) {
     const at = stamp()
     // Containment over the live phrases, not a token lookup: a phrase reads like
@@ -867,7 +899,12 @@ export default async function publicRoutes(fastify, options = {}) {
       },
       (error) => {
         attempt.failure = 'unreachable'
-        fastify.log.warn({ err: error }, 'the room session could not be opened')
+        // The dial that ended the start, when one did, in the same five fields
+        // and copied the same way as its own line above. Never `attempt`: its
+        // id IS the poll token. A start that failed before any dial (the app
+        // session refused, a cooldown that outlasted the budget) has no dial
+        // to name and logs `dial: null`.
+        fastify.log.warn({ err: error, dial: dialLogFields(error?.dial) }, 'the room session could not be opened')
       },
     )
 
@@ -1761,6 +1798,7 @@ export default async function publicRoutes(fastify, options = {}) {
 
   fastify.addHook('onClose', async () => {
     unsubscribeDanmaku()
+    unsubscribeDial()
     // Release exactly what this plugin took, by id, and let the source's own
     // refcount decide whether the socket closes. Stopping the source here would
     // be this plugin deciding the lifetime of something it does not own.
@@ -1773,6 +1811,41 @@ export default async function publicRoutes(fastify, options = {}) {
 }
 
 export { publicRoutes }
+
+// ---------------------------------------------------------------------------
+// Dial records, as a log line may carry them
+
+const DIAL_LOG_FIELDS = Object.freeze(['host', 'phase', 'elapsedMs', 'attempt', 'outcome'])
+
+/**
+ * The five fields of a transport dial record that a log line may carry, copied
+ * by name — or null when there is no record to copy.
+ *
+ * A whitelist rather than trust. The transport builds the record from these
+ * same five, and copying them again here is what keeps a field added there by
+ * mistake — the auth_body that authenticated the dial, say — out of production
+ * logs anyway. A value survives only as a string or a finite number, so a
+ * nested object cannot smuggle anything past the names either. A missing field
+ * reads null instead of vanishing: every line has the same five keys, and a log
+ * query never has to guess which were lost.
+ *
+ * It governs the `dial` field and nothing else. An error that carries its own
+ * `dial` is serialised by pino's err serializer, which copies the error's
+ * enumerable fields as they are; what reaches that copy is the transport's
+ * business, and by its contract it is the same five fields.
+ *
+ * Exported for the case that feeds it a poisoned record; the route above is its
+ * only caller.
+ */
+export function dialLogFields(record) {
+  if (record === null || typeof record !== 'object') return null
+  const fields = {}
+  for (const name of DIAL_LOG_FIELDS) {
+    const value = record[name]
+    fields[name] = typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) ? value : null
+  }
+  return fields
+}
 
 // ---------------------------------------------------------------------------
 // Multipart harvesting
