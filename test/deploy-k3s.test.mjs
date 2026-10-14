@@ -13,10 +13,13 @@
 //             wgets, the deployed image) the way a cluster would.
 //   ssh       a fake `ssh` first on PATH. It never opens a connection and
 //             refuses every host but the fixture alias, which is under the
-//             RFC 2606 `.invalid` TLD and so cannot resolve anywhere.
+//             RFC 2606 `.invalid` TLD and so cannot resolve anywhere. Where a
+//             test needs a remote, it runs the command in a local bash.
 //   pulls     PULL_CMD is an absolute path to a stub that records the image
-//             reference and fails for the one named in STUB_PULL_FAIL. The fake
-//             `sudo` answers the default PULL_CMD the same way, and nothing else.
+//             reference and fails for the one named in STUB_PULL_FAIL.
+//   sudo      a fake `sudo` first on PATH answers two calls only: the default
+//             PULL_CMD (as the pull stub would) and the local-build path's
+//             image listing. Anything else is a tripwire.
 //   the rest  k3s, crictl, ctr, docker and kubectl on PATH are tripwires: they
 //             record that they were reached and fail.
 //
