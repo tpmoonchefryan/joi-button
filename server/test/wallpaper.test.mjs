@@ -36,9 +36,14 @@ import {
 
 /** A directory that exists and is empty, so "nothing was written" is checkable. */
 function wallpaperDir(t) {
-  const dir = join(mkdtempSync(join(tmpdir(), 'joi-wallpaper-')), 'wallpaper')
+  // The cleanup removes the directory mkdtempSync made, not only the one inside
+  // it: removing just wallpaper/ left an empty joi-wallpaper-* in TMPDIR for every
+  // case that calls this (STORY-123). Registered before mkdirSync so a failure
+  // there is cleaned up too.
+  const root = mkdtempSync(join(tmpdir(), 'joi-wallpaper-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'wallpaper')
   mkdirSync(dir)
-  t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir
 }
 

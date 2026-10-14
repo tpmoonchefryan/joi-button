@@ -585,18 +585,23 @@ test('the defaults survive the API image layout, which carries server/ and no sr
   // It lives INSIDE the copy so module resolution walks app/node_modules, the
   // same way it does in the image. That keeps `../../src/App.vue` resolving
   // outside the copy — which is the whole point.
+  //
+  // The probe's database and storage paths go in a directory THIS test makes and
+  // removes, so nothing is left in TMPDIR whether the probe answers, throws or is
+  // killed (STORY-123). When the probe made its own, nothing ever removed it. It
+  // is outside the copy, where the probe's own directory always was.
+  const probeData = mkdtempSync(join(tmpdir(), 'joi-image-probe-'))
+  t.after(() => rmSync(probeData, { recursive: true, force: true }))
   const probe = join(app, 'image-defaults-probe.mjs')
   writeFileSync(
     probe,
     [
-      "import { mkdtempSync } from 'node:fs'",
-      "import { tmpdir } from 'node:os'",
       "import { join } from 'node:path'",
       "import Database from 'better-sqlite3'",
       "import Fastify from 'fastify'",
       "import { migrate } from './db/migrate.mjs'",
       "import adminRoutes from './routes/admin.mjs'",
-      "const dir = mkdtempSync(join(tmpdir(), 'joi-image-probe-'))",
+      'const dir = process.argv[2]',
       "const db = new Database(join(dir, 'joi.db'))",
       "migrate(db, { mode: 'development' })",
       'const server = Fastify({ logger: false })',
@@ -613,7 +618,7 @@ test('the defaults survive the API image layout, which carries server/ and no sr
       'process.exit(0)',
     ].join('\n'),
   )
-  const answer = JSON.parse(execFileSync(process.execPath, [probe], { encoding: 'utf8' }))
+  const answer = JSON.parse(execFileSync(process.execPath, [probe, probeData], { encoding: 'utf8' }))
 
   assert.deepEqual(answer, { ...DEFAULT_PALETTE }, 'the image answers a different palette from the repo')
   assert.equal(Object.keys(answer).length, THEME_TOKENS.length)
