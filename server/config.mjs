@@ -758,8 +758,8 @@ function readLingerMs(env) {
  *
  * connectTimeoutMs, 30s where lib/bili-transport.mjs defaults to 5s. That one
  * timer covers the WebSocket handshake, sending the auth packet and waiting for
- * AUTH_REPLY. This deployment runs in Singapore and dials danmaku servers in
- * mainland China; measured from inside the production API container with the
+ * AUTH_REPLY. This deployment dials danmaku servers in mainland China over a
+ * cross-border link; measured from inside the production API container with the
  * same Node and global WebSocket the transport uses (JOI-KB-004, 2026-10-14),
  * 19 of 24 handshakes to the usual endpoints opened within 5s (249-2722ms) and
  * 5 did not, and in an earlier run one of 8 had still not opened at 10s. Both
