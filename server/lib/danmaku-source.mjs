@@ -115,6 +115,23 @@
 //     'hang', `const p = acquire()`, then `await stop({ force: true })`. p stays
 //     pending until the clock is advanced by the full startTimeoutMs, waiting on
 //     a session that was torn down before the wait began.
+//   * Delete the `gen !== generation` check AFTER the wait in start()'s dial
+//     loop — red input: startRetryableFailures 1 with retryAfterMs 20000,
+//     acquire, let the first dial be refused, stop({ force: true }) during the
+//     wait, then advance 25000ms. The abort settled only the OUTER promise; the
+//     loop wakes up and dials again, so control.startCount() reads 2 and the
+//     double is listening for a session nobody holds. The twin check BEFORE the
+//     wait cannot be red-proven against the double, and says so rather than
+//     pretending: the double's stop() clears a pending start, so a dial in
+//     flight never comes back refused after a stop. Against the real transport
+//     it can (a connect timeout that fires after the stop is retryable), and
+//     that check is what keeps the loop from sleeping out a wait for a start
+//     nobody is waiting on any more.
+//   * Drop `onDial` from the transport.start() call in the dial loop, or stop
+//     the double reporting the dials it makes — the 'dial' event never fires
+//     and both forwarding cases go red. That event is the only trace of a dial
+//     that failed and was retried into success; nothing else would notice it
+//     going quiet.
 //   * Truncate displayName with slice() instead of by code points, or raise
 //     maxNameLength above 120 — two red inputs, one per half: a nickname of
 //     `'a' + '\u{1D4A5}'.repeat(100)` (slice(0, 128) cuts the 64th surrogate
@@ -188,14 +205,33 @@ export const DANMAKU_DEFAULTS = Object.freeze({
    */
   lingerMs: 0,
   /**
-   * Total time acquire() may spend getting to 'listening', across retries.
+   * How long acquire() may go on STARTING dials on its way to 'listening'.
    *
-   * startTimeoutMs (10s) bounds ONE dial. This bounds the whole attempt, and it
-   * has to be larger than one cooldown plus one dial — measured at up to 15s and
-   * 7s respectively — or the retry could never complete and would only add
-   * latency to a failure. 45s leaves room for one cooldown wait (20s), one dial
-   * (7s) and a second dial, and it is still a bounded promise to a visitor
-   * watching a spinner.
+   * A gate on the next dial, not a deadline on the current one. The loop reads
+   * it only after a dial has failed with something that waiting fixes, to
+   * decide whether one more wait-and-dial still fits; it never interrupts a
+   * dial in flight. Each dial is bounded on its own by startTimeoutMs (10s is
+   * the library default; the deployment's value in server/config.mjs has to
+   * sit above the transport's own staged timeouts, so that the error naming
+   * the stage that stalled arrives before this lifecycle's generic one).
+   *
+   * Two failures clear by waiting (see retryableWaitMs below), and 45s has to
+   * admit one wait plus one more dial for each, or the retry could never
+   * complete and would only add latency to a failure:
+   *
+   *   * the platform's restart cooldown (7001): refused after one
+   *     /v2/app/start round trip, asks for ~20s, measured to clear inside 15s;
+   *     a dial after it (cold starts were measured at up to 7s) still fits.
+   *   * a connect timeout (JOI-BUTTON-MIN-013 D1, 30s in the deployment): the
+   *     next dial goes to the next wss_link about 1.25s later, on the same
+   *     game session, and starts at ~31s — inside the budget.
+   *
+   * So the longest a visitor watches the spinner is NOT this number. When both
+   * dials stall for the full 30s, the second began inside the budget and is
+   * allowed to finish, and the room is reported unreachable after about 62s.
+   * That is the stated price of a 30s connect timeout on a cross-border
+   * handshake; cutting the second dial short would trade it for a failure that
+   * names the budget instead of the stage that stalled.
    */
   startBudgetMs: 45_000,
   maxRecordedGaps: 50,
@@ -309,6 +345,27 @@ export function normalizeDanmaku(raw, { receivedAt, limits = DANMAKU_DEFAULTS } 
  *   clock         injectable timers, for tests
  *   development   knobs for the programmable double (development mode only)
  *
+ * events, through on(event, listener), which returns its own unsubscribe:
+ *   'danmaku'     one normalised danmaku (see normalizeDanmaku)
+ *   'status'      status(), on every change of state
+ *   'error'       a failure with nobody left to return it to
+ *   'dial'        one record per dial the transport made, as the transport
+ *                 made it: { host, phase, elapsedMs, attempt, outcome }, where
+ *                 host is host:port, phase is 'connecting' (the handshake had
+ *                 not completed) or 'awaiting-auth-reply' (it had, and the
+ *                 room had not answered the auth packet), and outcome is 'ok'
+ *                 for the dial that got the room listening. Never auth_body,
+ *                 never a credential — the transport builds the record from
+ *                 those five and nothing else, and a listener that writes it
+ *                 to a log should still copy those five by name.
+ *
+ *                 Forwarded for every dial, including one made for a start
+ *                 that a stop has since cancelled: the record describes the
+ *                 network, and the network did not stop being slow because
+ *                 nobody was waiting any more. A refusal that came before any
+ *                 socket was dialled — the platform's cooldown answer to
+ *                 /v2/app/start, say — is not a dial and produces none.
+ *
  * In development mode the config must be one assertSafeConfig() has cleared. It
  * is not enough to remember to call the guard: the bypass is unconstructable
  * without it.
@@ -419,6 +476,15 @@ export function createDanmakuSource(config = {}) {
     lingerTimer = null
   }
 
+  // Handed to every transport.start() as onDial, and forwarded as it came: the
+  // record is the transport's, built from five named fields, and a listener that
+  // logs it copies those five by name as well. emit() never throws — a
+  // listener's exception goes to 'error' listeners instead — so a broken log
+  // sink cannot reach back into the dial that reported to it.
+  function reportDial(record) {
+    emitter.emit('dial', record)
+  }
+
   function ingest(raw) {
     let event
     try {
@@ -507,25 +573,37 @@ export function createDanmakuSource(config = {}) {
         try {
           return await withTimeout(
             clock,
-            transport.start({ onDanmaku: ingest, onDisconnect: handleDisconnect }),
+            transport.start({ onDanmaku: ingest, onDisconnect: handleDisconnect, onDial: reportDial }),
             opts.startTimeoutMs,
             `the transport did not become ready within ${opts.startTimeoutMs}ms`,
           )
         } catch (err) {
           const waitMs = retryableWaitMs(err)
           if (waitMs === null) throw err
+          // Superseded: a stop (which has already settled the waiter through
+          // `aborted`) or a later start owns the source now. Nobody is waiting
+          // on this loop any more, so it does not wait either.
+          if (gen !== generation) throw err
           // Not enough budget left to wait AND dial again: fail now with the
           // real reason rather than sleeping through the remainder and then
           // reporting a timeout, which would name the wrong cause.
           if (clock.now().getTime() + waitMs >= deadline) throw err
           await delay(clock, waitMs)
+          // Asked again on waking, and this is the check that holds the line: a
+          // stop that landed DURING the wait settled the waiter, but not this
+          // loop. Without it the next turn dials for a session nobody holds —
+          // stop() has already run its transport.stop() and will not come back,
+          // so whatever that dial opens is never closed.
+          if (gen !== generation) throw err
         }
       }
     }
 
     // aborted races the WHOLE loop, not one dial: a stop arriving while we are
-    // waiting out a cooldown must cancel the wait, or the source would keep
-    // dialling for a session nobody holds.
+    // waiting out a cooldown or a connect timeout settles the waiter at once
+    // rather than after the wait. It does NOT stop the loop — a race settles
+    // its own promise and leaves the losers running — which is why the loop
+    // above checks the generation for itself on both sides of every wait.
     const attempt = Promise.race([dial(), aborted])
 
     // Cleared BY IDENTITY, not unconditionally. When a stop aborts this start
@@ -854,16 +932,36 @@ function createDevelopmentTransport(devConfig, clock) {
   return {
     kind: 'development',
 
-    start({ onDanmaku, onDisconnect }) {
+    // Reports its dials the way the real transport does — one record through
+    // onDial as each dial ends, the same record on the error a failed dial
+    // rejects with — because the per-dial log line is otherwise unfalsifiable
+    // through this double: a route that never logs a dial passes every test
+    // that cannot make one happen. The record is synthetic and says so:
+    // host 'development', elapsedMs the configured latency, attempt the start
+    // count. Only starts that reach the point where the real transport would
+    // have dialled report one; see the two exceptions below.
+    start({ onDanmaku, onDisconnect, onDial }) {
       state.startCount += 1
       state.onDanmaku = onDanmaku
       state.onDisconnect = onDisconnect
       const behaviour = state.behaviour
+      // Captured now rather than read when the timer fires: the record
+      // describes THIS dial, and a knob turned while it is in flight belongs to
+      // the next one.
+      const attempt = state.startCount
+      const latencyMs = state.latencyMs
+      const dialEnded = (outcome, phase) => {
+        const record = Object.freeze({ host: 'development', phase, elapsedMs: latencyMs, attempt, outcome })
+        if (typeof onDial === 'function') onDial(record)
+        return record
+      }
       return new Promise((resolve, reject) => {
         clearPending()
         state.pendingTimer = clock.setTimeout(() => {
           state.pendingTimer = null
           if (state.retryableFailuresRemaining > 0) {
+            // No dial record. On the platform this refusal is the answer to
+            // /v2/app/start, which comes before any socket is dialled.
             state.retryableFailuresRemaining -= 1
             const cooling = new Error('simulated cooldown (请求冷却期)')
             cooling.retryable = true
@@ -872,13 +970,19 @@ function createDevelopmentTransport(devConfig, clock) {
             return
           }
           if (behaviour === 'fail') {
-            reject(new Error(state.failureMessage))
+            const failure = new Error(state.failureMessage)
+            failure.dial = dialEnded('error', 'connecting')
+            reject(failure)
             return
           }
-          if (behaviour === 'hang') return // never settles; the lifecycle times it out
+          // Never settles, so never ends a dial and never reports one: the
+          // lifecycle times it out, and that timeout is the lifecycle's, not a
+          // dial's.
+          if (behaviour === 'hang') return
           state.listening = true
+          dialEnded('ok', 'awaiting-auth-reply')
           resolve()
-        }, state.latencyMs)
+        }, latencyMs)
       })
     },
 
@@ -1034,11 +1138,23 @@ function realClock() {
  * How long to wait before dialling again, or null when this error is not one
  * that waiting fixes.
  *
- * The transport sets both fields, on two errors that mean "not yet" rather than
- * "broken": the platform's own restart cooldown (code 7001) and the transport's
- * backoff gate, which is a clock and therefore opens by itself. Anything else —
- * a bad credential, the wrong room, a refused TLS handshake — is not improved by
- * waiting, and retrying it would turn a clear error into a slow one.
+ * The transport sets both fields on exactly two kinds of error, the two that
+ * mean "not yet" rather than "broken":
+ *
+ *   * the platform's own restart cooldown (code 7001), which is known to clear;
+ *   * a connect timeout — the socket did not open, or opened and was not
+ *     answered, inside connectTimeoutMs (JOI-BUTTON-MIN-013 D1). A slow
+ *     cross-border handshake is the next wss_link's problem, not a verdict on
+ *     the room, and the transport keeps the game session so the next dial
+ *     reuses it rather than walking into the cooldown that ending it causes.
+ *
+ * NOT the transport's backoff gate. An earlier version of this note listed it
+ * as retryable, and lib/bili-transport.mjs says the opposite on purpose: that
+ * gate is reached after consecutive genuine failures, and waiting it out would
+ * spend a visitor's whole budget to fail anyway. Anything else — a bad
+ * credential, the wrong room, an auth packet the room refused, a socket that
+ * errored or closed before it authenticated — is not improved by waiting
+ * either, and retrying it would turn a clear error into a slow one.
  */
 function retryableWaitMs(error) {
   if (error === null || typeof error !== 'object') return null

@@ -440,7 +440,88 @@ test('a clean stop stops the heartbeat too, not only the socket', async () => {
 })
 
 // ---------------------------------------------------------------------------
+// Every dial is reported (JOI-BUTTON-STORY-118)
+//
+// A dial that failed and was retried into success leaves no other trace: the
+// visitor got a code, the state never left 'starting'. These cases hold the
+// lifecycle to forwarding what the transport reports, so the route's per-dial
+// log line has something to write.
+
+const DIAL_KEYS = Object.freeze(['attempt', 'elapsedMs', 'host', 'outcome', 'phase'])
+
+test('a dial that gets the room listening is reported once on the dial event, with the five fields and no others', async () => {
+  const { source, clock } = devDanmakuSource({ development: { startLatencyMs: 40 } })
+  const dials = collect(source, 'dial')
+
+  const lease = await listening(source, clock, 40)
+
+  assert.equal(dials.length, 1, 'a dial that succeeded was not reported exactly once')
+  const [record] = dials
+  assert.deepEqual(Object.keys(record).sort(), DIAL_KEYS)
+  assert.equal(record.outcome, 'ok')
+  assert.equal(record.phase, 'awaiting-auth-reply')
+  assert.equal(record.elapsedMs, 40)
+  assert.equal(record.attempt, 1)
+  assert.equal(typeof record.host, 'string')
+
+  source.release(lease.leaseId)
+  await clock.advance(0)
+  assert.equal(dials.length, 1, 'a stop was reported as a dial')
+})
+
+test('a dial that fails is reported with an outcome that is not ok, and acquire() rejects with that same record on its error', async () => {
+  const { source, clock } = devDanmakuSource({ development: { startBehaviour: 'fail' } })
+  const dials = collect(source, 'dial')
+
+  // The handlers are attached before the clock moves; afterwards the rejection
+  // would be reported as unhandled instead of read here.
+  const failure = source.acquire().then(
+    () => assert.fail('a start the transport refused resolved as listening'),
+    (err) => err,
+  )
+  await clock.advance(0)
+  const err = await failure
+
+  assert.match(err.message, /simulated start failure/)
+  assert.equal(dials.length, 1, 'a dial that failed was not reported exactly once')
+  const [record] = dials
+  assert.deepEqual(Object.keys(record).sort(), DIAL_KEYS)
+  assert.notEqual(record.outcome, 'ok')
+  // The SAME record, not an equal one. The lifecycle forwards what the
+  // transport made, so the route's per-dial line and its final warn describe
+  // one dial rather than two that happen to agree.
+  assert.equal(err.dial, record, 'the error acquire() rejected with does not carry the dial that failed')
+})
+
+// ---------------------------------------------------------------------------
 // Fidelity of the double
+
+test('the double reports a dial only where the real transport would have made one: not for a cooldown refusal, not for a start that never settles', async () => {
+  // A cooldown is the platform's answer to /v2/app/start, before any socket is
+  // dialled. A double that reported it would have the route log a failed dial
+  // that never happened.
+  const cooling = devDanmakuSource({ development: { startRetryableFailures: 1, retryAfterMs: 1_000 } })
+  const cooled = collect(cooling.source, 'dial')
+  const lease = await listening(cooling.source, cooling.clock, 1_500)
+  assert.equal(cooling.source.control.startCount(), 2, 'the cooldown was never hit, so this case proves nothing')
+  // Asked in two steps so that each failure names itself: no record at all is
+  // a lifecycle that stopped forwarding, not a double that over-reports.
+  assert.equal(cooled.at(-1)?.outcome, 'ok', 'the dial that got the room listening was not reported')
+  assert.equal(cooled.length, 1, 'the cooldown refusal was reported as a dial')
+  assert.equal(cooled[0].attempt, 2, 'the dial was not numbered by the start it was')
+  cooling.source.release(lease.leaseId)
+  await cooling.clock.advance(0)
+
+  // The lifecycle's start timeout is the lifecycle's, not a dial's: against the
+  // real transport the dial it gave up on still ends and reports itself, so a
+  // record invented here would count that dial twice.
+  const hanging = devDanmakuSource({ development: { startBehaviour: 'hang' } })
+  const hung = collect(hanging.source, 'dial')
+  const timedOut = assert.rejects(hanging.source.acquire(), /the transport did not become ready within 10000ms/)
+  await hanging.clock.advance(10_000)
+  await timedOut
+  assert.equal(hung.length, 0, 'a start that never settled was reported as a dial')
+})
 
 test('the double refuses to deliver a danmaku once the source has stopped, because the real transport could not either', async () => {
   const { source, clock } = devDanmakuSource()

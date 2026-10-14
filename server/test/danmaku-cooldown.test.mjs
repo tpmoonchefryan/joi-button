@@ -131,6 +131,41 @@ test('a cooldown that never clears still ends, rather than retrying forever', as
   assert.ok(left > 90, `retried ${99 - left} times, which is not bounded`)
 })
 
+test('a stop during the wait ends the dial loop as well as the waiter: no second dial, no session nobody holds', async (t) => {
+  // JOI-BUTTON-STORY-118 makes this window common: a connect timeout is now
+  // retryable too, so a visitor who gives up during a 30s dial or the ~1.25s
+  // wait after it lands a stop here. The cooldown shape reaches the same loop
+  // and is the one the double can produce.
+  const { source: src, clock } = source(t, {
+    development: { startRetryableFailures: 1, retryAfterMs: 20_000 },
+  })
+
+  // Handler attached before time moves, as everywhere in this file.
+  const cancelled = assert.rejects(src.acquire(), /the start was cancelled by a stop/)
+  await clock.advance(1)
+  // The first dial was refused with the cooldown shape and the loop is now
+  // waiting it out — the window this case is about.
+  assert.equal(src.status().state, 'starting')
+  assert.equal(src.control.startCount(), 1)
+
+  await src.stop({ force: true })
+  await cancelled
+
+  // Past the end of the wait AND past the latency of the dial that would follow
+  // it. The stop settled the waiter at once, through the race; the loop behind
+  // a settled race keeps running, and unguarded it wakes up in here and dials.
+  await clock.advance(25_000)
+
+  assert.equal(src.control.startCount(), 1, 'the loop dialled again after the stop, for a session nobody holds')
+  assert.equal(
+    src.control.isListening(),
+    false,
+    'a dial made after the stop left the room listening for nobody, and nothing will close it',
+  )
+  assert.equal(src.status().state, 'stopped')
+  assert.equal(src.status().waiters, 0)
+})
+
 test('with a linger, the session survives the gap between two visitors', async (t) => {
   const { source: src, clock } = source(t, { lifecycle: { lingerMs: 45_000 } })
 
