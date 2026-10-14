@@ -46,6 +46,12 @@ const REPO_SHAPE = {
   api: /^ghcr\.io\/[a-z0-9]([a-z0-9-]*[a-z0-9])?\/joi-button\/api$/,
 }
 
+// The tag shape deploy-to-prod must accept, verbatim from STORY-119 SUB-013's
+// acceptance criteria; the shell's own check is compared against it case by case.
+// Without the m flag, `$` here matches only at the very end, so a trailing
+// newline does not pass.
+const TAG_SHAPE = /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
 // Fake secrets. The fake ssh never reads them, and a `.invalid` name never
 // resolves, so even a real ssh reached by mistake would connect nowhere.
 const FAKE_SECRETS = {
@@ -414,6 +420,73 @@ test('deploy-to-prod refuses, before ssh and naming the variable, any repository
           assert.equal(calls.length, 0, `${label} reached ssh`)
           assert.match(r.stdout, errorNaming(name), label)
         }
+      }
+    }
+  } finally {
+    box.dispose()
+  }
+})
+
+test('deploy-to-prod refuses, before the key file is written or ssh runs and naming DEPLOY_TAG, any tag that is not exactly v<digits>.<digits>.<digits>', { skip }, () => {
+  const values = [
+    'v9.9.9',
+    'v10.20.30',
+    'v0.0.0',
+    'v2.7.6',
+    'v123.4567.89',
+    '',
+    "v1.2.3';id;'",
+    'v1.2.3-rc.1',
+    'v1.2.3+build.5',
+    'v1.2',
+    'v1..2.3',
+    'v1.2.3.4',
+    'v.1.2.3',
+    'v1.2.3.',
+    'v',
+    '1.2.3',
+    'V1.2.3',
+    'vv1.2.3',
+    'v1.2.x',
+    ' v1.2.3',
+    'v1.2.3 ',
+    'v1.2 .3',
+    'v1.2.3\t',
+    'v1.2.3\n',
+    'v1.2.3\nid',
+    'v1.2.3;id',
+    'v1.2.3$(id)',
+    'v1.2.3`id`',
+    'v1.2.٣', // ARABIC-INDIC DIGIT THREE: a digit, but not one of 0123456789
+    'v1.2.³', // SUPERSCRIPT THREE
+  ]
+  assert.ok(values.filter((v) => TAG_SHAPE.test(v)).length >= 3, 'the table keeps its accepted cases')
+  assert.ok(values.filter((v) => !TAG_SHAPE.test(v)).length >= 8, 'the table keeps its refused cases')
+  const box = sandbox()
+  try {
+    for (const value of values) {
+      const label = `DEPLOY_TAG=${JSON.stringify(value)}`
+      const { r, run, calls } = deployScript(box, {
+        ...FAKE_SSH_ENV, DEPLOY_TAG: value, IMAGE_REPO: WEB, API_IMAGE_REPO: API,
+      })
+      const keyWritten = existsSync(join(run.home, '.ssh', 'id_deploy'))
+      if (TAG_SHAPE.test(value)) {
+        // As before the check was tightened: one ssh call, which checks out the
+        // tag and starts deploy-k3s.sh pinned to it.
+        assert.equal(r.status, 0, `${label} should deploy:\n${r.stdout}${r.stderr}`)
+        assert.ok(keyWritten, `${label}: no key file`)
+        assert.equal(calls.length, 1, label)
+        const { command } = splitSsh(calls[0])
+        assert.ok(command.includes(`checkout --quiet --force 'refs/tags/${value}';`), `${label}: ${command}`)
+        const received = replayOnNode(box, command)
+        assert.deepEqual(received.argv, ['apply'], label)
+        assert.equal(received.env.TAG, value, label)
+        assert.equal(received.env.IMAGE_SOURCE, 'registry', label)
+      } else {
+        assert.notEqual(r.status, 0, `${label} should be refused`)
+        assert.match(r.stdout, errorNaming('DEPLOY_TAG'), label)
+        assert.equal(keyWritten, false, `${label}: the key file was written before the refusal`)
+        assert.equal(calls.length, 0, `${label} reached ssh`)
       }
     }
   } finally {

@@ -343,11 +343,30 @@ jobs:
           set -euo pipefail
 
           # DEPLOY_TAG lands in a remote shell command below, so accept only a
-          # plain vMAJOR.MINOR.PATCH — nothing that could carry a shell metachar.
-          case "$DEPLOY_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) : ;;
-            *) echo "::error::refusing to deploy non-version tag '$DEPLOY_TAG'"; exit 1 ;;
-          esac
+          # value that is exactly v<digits>.<digits>.<digits> (the regex
+          # ^v[0-9]+\.[0-9]+\.[0-9]+$): a leading v, then three non-empty runs of
+          # the digits 0123456789, joined by single dots. The ten digits are
+          # listed one by one rather than written as a range, whose members can
+          # depend on the locale. Anything else is refused here, before the key
+          # file is written or ssh runs: an empty value; a missing, extra or empty
+          # part; a pre-release or build suffix (so a v1.2.3-rc.1 tag publishes
+          # its images but does not deploy); whitespace, a newline or any other
+          # character.
+          is_version() {  # <value>
+            case "$1" in
+              v*) : ;;
+              *) return 1 ;;
+            esac
+            case "${1#v}" in
+              *[!0123456789.]*|.*|*.|*..*|*.*.*.*) return 1 ;;
+              *.*.*) return 0 ;;
+            esac
+            return 1
+          }
+          if ! is_version "${DEPLOY_TAG:-}"; then
+            echo "::error::refusing to deploy DEPLOY_TAG '${DEPLOY_TAG:-}': expected v<digits>.<digits>.<digits> and nothing else"
+            exit 1
+          fi
           # IMAGE_REPO and API_IMAGE_REPO land in the same remote command, so
           # accept only ghcr.io/<owner>/joi-button/<web|api>, where <owner> is
           # lowercase letters, digits and inner hyphens. An empty value (a job
