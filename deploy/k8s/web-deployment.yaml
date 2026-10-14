@@ -58,7 +58,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: web
-          image: ghcr.io/ryanlan-new/joi-button/web:replace-me
+          image: ghcr.io/tpmoonchefryan/joi-button/web:replace-me
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

@@ -71,7 +71,7 @@ spec:
               # The API image, because it already carries node, better-sqlite3
               # compiled for this platform, and the script. A second image would
               # be a second thing to keep in step with db/schema.sql.
-              image: ghcr.io/ryanlan-new/joi-button/api:replace-me
+              image: ghcr.io/tpmoonchefryan/joi-button/api:replace-me
               imagePullPolicy: IfNotPresent
               command: ["node", "scripts/backup.mjs"]
               securityContext:

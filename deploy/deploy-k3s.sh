@@ -19,6 +19,10 @@
 #   deploy/deploy.env (git-ignored) and fill it in, or export the same names in
 #   your shell. Nothing here has a fallback that would quietly point at somebody
 #   else's cluster: the two values that identify a deployment are REQUIRED.
+#   For every name listed below, a NON-EMPTY value exported by the caller wins over
+#   the same name in deploy.env; the file only fills the names the caller left unset
+#   or exported empty. That is what lets CI pass IMAGE_REPO/API_IMAGE_REPO to a node
+#   whose deploy.env says something else.
 #
 #   Required (no default — the script refuses to guess):
 #     REMOTE                 ssh host alias of the k3s node          (import, apply)
@@ -39,8 +43,9 @@
 #   Optional:
 #     LB_ADDRESS             ingress load-balancer address, used only to print a
 #                            DNS-independent curl at the end
-#     IMAGE_REPO             default ghcr.io/ryanlan-new/joi-button/web
-#     API_IMAGE_REPO         default ghcr.io/ryanlan-new/joi-button/api
+#     IMAGE_REPO             default ghcr.io/tpmoonchefryan/joi-button/web
+#     API_IMAGE_REPO         default ghcr.io/tpmoonchefryan/joi-button/api
+#     IMAGE_SOURCE           default local  local | registry   (see the note at its default)
 #     RUNTIME_ENV_FILE       default deploy/runtime.env
 #     TAG                    default dev-<short git sha of HEAD>
 #     NAMESPACE              default joi-button
@@ -79,8 +84,8 @@
 
 set -euo pipefail
 
-DEFAULT_IMAGE_REPO="ghcr.io/ryanlan-new/joi-button/web"
-DEFAULT_API_IMAGE_REPO="ghcr.io/ryanlan-new/joi-button/api"
+DEFAULT_IMAGE_REPO="ghcr.io/tpmoonchefryan/joi-button/web"
+DEFAULT_API_IMAGE_REPO="ghcr.io/tpmoonchefryan/joi-button/api"
 DEFAULT_NAMESPACE="joi-button"
 PLACEHOLDER_IMAGE="${DEFAULT_IMAGE_REPO}:replace-me"
 PLACEHOLDER_API_IMAGE="${DEFAULT_API_IMAGE_REPO}:replace-me"
@@ -102,16 +107,40 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Site-specific values come from a git-ignored file, so this repository states no
 # cluster's identity. Already-exported variables win: the file only fills gaps.
+#
+# "Already-exported" covers every name the header documents, not only the three
+# that identify a deployment. Sourcing the file would otherwise overwrite them —
+# and the one caller that must not lose that race is CI, which exports the image
+# repositories it just pushed to; a deploy.env written before a repository move
+# would quietly point the rollout at images that do not exist. So: remember each
+# documented name the caller exported NON-EMPTY, read the file, put them back. An
+# exported empty value does not count as set (REMOTE always behaved that way), so
+# the file's value stands. ENV_FILE itself is on the list so the file cannot
+# rename itself in the messages printed at the end.
+CALLER_WINS=(
+  REMOTE APP_HOST LB_ADDRESS
+  IMAGE_REPO API_IMAGE_REPO IMAGE_SOURCE TAG NAMESPACE KUBECTL
+  RUNTIME_ENV_FILE MANIFEST_DIR ROLLOUT_TIMEOUT RESTART_IF_UNCHANGED
+  SMOKE ALLOW_REGISTRY_PULL ENV_FILE
+)
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/deploy.env}"
 if [[ -f "${ENV_FILE}" ]]; then
-  _pre_remote="${REMOTE:-}"; _pre_host="${APP_HOST:-}"; _pre_lb="${LB_ADDRESS:-}"
+  _caller_values=()
+  for _name in "${CALLER_WINS[@]}"; do
+    # ${!_name} is the value of the variable NAMED by _name (bash indirection).
+    if [[ -n "${!_name:-}" ]]; then
+      _caller_values[${#_caller_values[@]}]="${_name}=${!_name}"
+    fi
+  done
   set -a
   # shellcheck disable=SC1090
   . "${ENV_FILE}"
   set +a
-  [[ -n "${_pre_remote}" ]] && REMOTE="${_pre_remote}"
-  [[ -n "${_pre_host}" ]] && APP_HOST="${_pre_host}"
-  [[ -n "${_pre_lb}" ]] && LB_ADDRESS="${_pre_lb}"
+  if [[ ${#_caller_values[@]} -gt 0 ]]; then
+    for _pair in "${_caller_values[@]}"; do
+      printf -v "${_pair%%=*}" '%s' "${_pair#*=}"
+    done
+  fi
 fi
 
 IMAGE_REPO="${IMAGE_REPO:-${DEFAULT_IMAGE_REPO}}"
