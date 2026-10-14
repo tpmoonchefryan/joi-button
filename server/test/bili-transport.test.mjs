@@ -47,6 +47,7 @@ import {
   canonicalStringFromHeaders,
   createBiliTransport,
   decodeFrame,
+  dialHost,
   encodePacket,
   signOpenPlatformRequest,
 } from '../lib/bili-transport.mjs'
@@ -1399,7 +1400,11 @@ test('through the lifecycle, a connect timeout redials the next wss_link on the 
     assert.equal(rig.connections.length, 1, 'the redial did not go to the next wss_link')
     assert.notEqual(silent[0].authBody, null, 'the first dial never sent its auth packet')
     assert.equal(rig.connections[0].authBody, silent[0].authBody, 'the redial did not send the same auth_body verbatim')
-    assert.deepEqual(states, ['starting', 'listening'], 'the visitor saw something other than 准备中 during the redial')
+    assert.deepEqual(
+      states,
+      ['starting', 'listening'],
+      'the visitor saw something other than 准备中 during the redial',
+    )
 
     // The session that was redialled is the one the visitor holds, and it is
     // ended when they let go — not leaked because it was carried across a dial.
@@ -1758,5 +1763,382 @@ test('a dial that was stopped does not reach into the session a later start open
     await rig.transport.stop().catch(() => {})
     await rig.close()
     await stalled.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// one record per dial (JOI-BUTTON-STORY-118)
+//
+// Before this, a failed dial left one warn with no host and no phase, and a
+// dial that succeeded on a retry left nothing at all, so the failure rate MIN-013
+// D2 has to judge was invisible. Every dial now ends in one record of five keys
+// — host, phase, elapsedMs, attempt, outcome — handed to the caller's onDial
+// and, on failure, carried by the error as err.dial. These cases hold its shape
+// and, as much as its shape, what it must never carry.
+
+const DIAL_KEYS = ['attempt', 'elapsedMs', 'host', 'outcome', 'phase']
+
+function portOf(url) {
+  return new URL(url).port
+}
+
+test('a dial that never completes the websocket handshake is reported once: connecting, timeout, and err.dial is that record', async () => {
+  let rig = null
+  // The injected clock moves while the dial is in flight, so elapsedMs is
+  // provably measured across the dial on that clock.
+  const stalled = await startStalledServer({ onUpgrade: () => rig.clock.advance(1_234) })
+  rig = await wiredTransport({
+    gatewayHandler: (call) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url]) : null),
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const records = []
+  try {
+    await assert.rejects(
+      () => rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) }),
+      (err) => {
+        assert.equal(records.length, 1, 'a dial was reported more or less than once')
+        assert.deepEqual(records[0], {
+          host: `127.0.0.1:${stalled.port}`,
+          phase: 'connecting',
+          elapsedMs: 1_234,
+          attempt: 1,
+          outcome: 'timeout',
+        })
+        assert.equal(err.dial, records[0], 'the error does not carry the record the caller was given')
+        assert.match(err.message, /did not authenticate within 300ms \(phase: connecting\)/)
+        return true
+      },
+    )
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('a dial that handshakes but never hears AUTH_REPLY is reported as awaiting-auth-reply', async () => {
+  const rig = await wiredTransport({ onConnection: () => {}, transport: { connectTimeoutMs: STALL_MS } })
+  const records = []
+  try {
+    await assert.rejects(
+      () => rig.transport.start({ onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) }),
+      (err) => {
+        assert.equal(err.dial, records[0])
+        assert.match(err.message, /\(phase: awaiting-auth-reply\)/)
+        return true
+      },
+    )
+    assert.equal(records.length, 1)
+    assert.equal(
+      records[0].phase,
+      'awaiting-auth-reply',
+      'a server that let us in and said nothing read as a slow network',
+    )
+    assert.equal(records[0].outcome, 'timeout')
+    assert.equal(records[0].host, `127.0.0.1:${portOf(rig.ws.url)}`)
+    assert.notEqual(rig.connections[0].authBody, null, 'the auth packet was never sent, so nothing was awaited')
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a successful dial and an auth rejection are each reported once, from awaiting-auth-reply', async () => {
+  const ok = await wiredTransport()
+  const okRecords = []
+  try {
+    await ok.transport.start({ onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => okRecords.push(r) })
+    assert.equal(okRecords.length, 1)
+    const { elapsedMs, ...rest } = okRecords[0]
+    assert.deepEqual(rest, {
+      host: `127.0.0.1:${portOf(ok.ws.url)}`,
+      phase: 'awaiting-auth-reply',
+      attempt: 1,
+      outcome: 'ok',
+    })
+    assert.ok(Number.isInteger(elapsedMs) && elapsedMs >= 0, `elapsedMs ${elapsedMs} is not a non-negative integer`)
+
+    // Traffic after the dial is not another dial.
+    ok.connections[0].send(danmakuPacket({ openId: 'open-after', uname: 'After', msg: 'JOI-AFTR' }))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(okRecords.length, 1)
+  } finally {
+    await ok.transport.stop().catch(() => {})
+    await ok.close()
+  }
+
+  const rejected = await wiredTransport({ onConnection: rejectingAuth })
+  const rejectedRecords = []
+  try {
+    await assert.rejects(
+      () =>
+        rejected.transport.start({
+          onDanmaku: () => {},
+          onDisconnect: () => {},
+          onDial: (r) => rejectedRecords.push(r),
+        }),
+      (err) => {
+        assert.match(err.message, /rejected our auth packet \(code -101\)/)
+        assert.equal(err.dial, rejectedRecords[0])
+        return true
+      },
+    )
+    assert.equal(rejectedRecords.length, 1)
+    assert.equal(rejectedRecords[0].outcome, 'auth-rejected')
+    assert.equal(rejectedRecords[0].phase, 'awaiting-auth-reply')
+  } finally {
+    await rejected.transport.stop().catch(() => {})
+    await rejected.close()
+  }
+})
+
+for (const [what, onConnection] of [
+  ['closes', closingBeforeAuth],
+  ['drops', droppingBeforeAuth],
+]) {
+  test(`a socket that ${what} before auth is reported once, with the outcome its error names`, async () => {
+    const rig = await wiredTransport({ onConnection, transport: { connectTimeoutMs: 2_000 } })
+    const records = []
+    try {
+      const err = await rig.transport
+        .start({ onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) })
+        .then(
+          () => null,
+          (e) => e,
+        )
+      assert.ok(err instanceof Error)
+      assert.equal(records.length, 1)
+      assert.equal(err.dial, records[0])
+      // Which of error and close undici delivers first is its business; the
+      // record and the message must agree on it.
+      const expected = {
+        'socket-closed': /closed before authenticating/,
+        'socket-error': /errored before authenticating/,
+      }
+      assert.ok(records[0].outcome in expected, `unexpected outcome ${records[0].outcome}`)
+      assert.match(err.message, expected[records[0].outcome])
+      assert.equal(records[0].phase, 'awaiting-auth-reply')
+    } finally {
+      await rig.transport.stop().catch(() => {})
+      await rig.close()
+    }
+  })
+}
+
+test('a wss_link the runtime cannot parse is still one dial, reported as a socket error', async () => {
+  const rig = await wiredTransport({
+    gatewayHandler: (call) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer(['not a websocket url']) : null),
+  })
+  const records = []
+  try {
+    const err = await rig.transport
+      .start({ onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) })
+      .then(
+        () => null,
+        (e) => e,
+      )
+    assert.ok(err instanceof Error, 'a dial to an unparseable address succeeded')
+    assert.equal(records.length, 1)
+    assert.deepEqual(
+      { ...records[0], elapsedMs: 0 },
+      { host: 'unparseable', phase: 'connecting', elapsedMs: 0, attempt: 1, outcome: 'socket-error' },
+    )
+    assert.equal(err.dial, records[0])
+    assert.equal(rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length, 1, 'the session was left running')
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a redial on the held session is the second record: attempts 1 and 2, each on its own host', async () => {
+  const stalled = await startStalledServer()
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url, wssUrl]) : null),
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const records = []
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) }
+  try {
+    await assert.rejects(() => rig.transport.start(handlers), (err) => err.retryable === true)
+    rig.clock.advance(1_250)
+    await rig.transport.start(handlers)
+    assert.deepEqual(
+      records.map(({ elapsedMs, ...rest }) => rest),
+      [
+        { host: `127.0.0.1:${stalled.port}`, phase: 'connecting', attempt: 1, outcome: 'timeout' },
+        { host: `127.0.0.1:${portOf(rig.ws.url)}`, phase: 'awaiting-auth-reply', attempt: 2, outcome: 'ok' },
+      ],
+    )
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('no dial record and no err.dial carries a credential, the auth body, or anything of the wss_link but host and port', async () => {
+  // Every outcome a record can have in practice, from one transport: a
+  // timeout, a refused redial on the held session, and a fresh session that
+  // authenticates. The wss_links carry a query, as nothing promises they never
+  // will, and the record must not.
+  const stalled = await startStalledServer()
+  let answered = 0
+  let starts = 0
+  const rig = await wiredTransport({
+    gatewayHandler: (call, wssUrl) => {
+      if (call.path !== OPEN_LIVE_PATHS.start) return null
+      starts += 1
+      const links = starts === 1 ? [stalled.url, wssUrl] : [wssUrl]
+      return startAnswer(
+        links.map((link) => `${link}?key=wss-query-secret`),
+        { gameId: `game-000${starts}` },
+      )
+    },
+    onConnection: (conn) => {
+      answered += 1
+      if (answered === 1) rejectingAuth(conn)
+      else defaultAuth(conn)
+    },
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const records = []
+  const errors = []
+  const handlers = { onDanmaku: () => {}, onDisconnect: () => {}, onDial: (r) => records.push(r) }
+  const attempt = () =>
+    rig.transport.start(handlers).catch((err) => {
+      errors.push(err)
+    })
+  try {
+    await attempt() // stalls: timeout, session held
+    rig.clock.advance(1_250)
+    await attempt() // redial on the held session: auth rejected, session ended
+    rig.clock.advance(2_250)
+    await attempt() // a fresh session: ok
+    assert.deepEqual(
+      records.map((r) => r.outcome),
+      ['timeout', 'auth-rejected', 'ok'],
+    )
+    assert.equal(errors.length, 2)
+    assert.deepEqual(
+      errors.map((err) => err.dial),
+      records.slice(0, 2),
+    )
+
+    const forbidden = [
+      CREDENTIALS.accessKeyId,
+      CREDENTIALS.accessKeySecret,
+      CREDENTIALS.roomOwnerAuthCode,
+      'auth-token', // inside auth_body
+      '/sub', // the wss_link path
+      'wss-query-secret', // the wss_link query
+      'game-000', // the game session
+    ]
+    for (const record of [...records, ...errors.map((err) => err.dial)]) {
+      assert.deepEqual(Object.keys(record).sort(), DIAL_KEYS, 'a dial record grew a key')
+      assert.ok(Object.isFrozen(record), 'a dial record can be edited by whoever logs it')
+      const text = JSON.stringify(record)
+      for (const secret of forbidden) {
+        assert.equal(text.includes(secret), false, `a dial record carries ${secret}: ${text}`)
+      }
+    }
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+})
+
+test('dialHost writes out the port and never the path, the query, or userinfo', () => {
+  assert.equal(
+    dialHost('wss://zj-cn-live-comet.chat.bilibili.com:2245/sub?token=abc'),
+    'zj-cn-live-comet.chat.bilibili.com:2245',
+  )
+  // new URL() drops a default port; the record writes it back, so 443 and 2245
+  // dials of the same host are told apart the same way in every log line.
+  assert.equal(dialHost('wss://broadcastlv.chat.bilibili.com:443/sub'), 'broadcastlv.chat.bilibili.com:443')
+  assert.equal(dialHost('wss://broadcastlv.chat.bilibili.com/sub'), 'broadcastlv.chat.bilibili.com:443')
+  assert.equal(dialHost('ws://127.0.0.1/sub'), '127.0.0.1:80')
+  assert.equal(dialHost('ws://user:pass@127.0.0.1:9/sub'), '127.0.0.1:9')
+  assert.equal(dialHost('not a websocket url'), 'unparseable')
+})
+
+test('a dial that a stop() overtakes still reports to the onDial it was started with, and a throwing onDial changes nothing', async () => {
+  let arrived
+  const upgraded = new Promise((resolve) => {
+    arrived = resolve
+  })
+  const stalled = await startStalledServer({ onUpgrade: () => arrived() })
+  const rig = await wiredTransport({
+    gatewayHandler: (call) => (call.path === OPEN_LIVE_PATHS.start ? startAnswer([stalled.url]) : null),
+    transport: { connectTimeoutMs: STALL_MS },
+  })
+  const records = []
+  try {
+    const outcome = rig.transport
+      .start({
+        onDanmaku: () => {},
+        onDisconnect: () => {},
+        onDial: (r) => {
+          records.push(r)
+          throw new Error('onDial-boom')
+        },
+      })
+      .then(
+        () => null,
+        (err) => err,
+      )
+    await upgraded
+    await rig.transport.stop() // nulls the handlers; the dial is still running
+    assert.equal(records.length, 0)
+
+    const err = await outcome
+    assert.equal(records.length, 1, 'the record of a dial that a stop overtook went nowhere')
+    assert.equal(records[0].outcome, 'cancelled', 'a dial stop() cancelled was counted as a network timeout')
+    assert.equal(records[0].phase, 'connecting')
+    assert.equal(err.dial, records[0])
+    // Its own error, not the callback's.
+    assert.match(err.message, /did not authenticate within 300ms/)
+  } finally {
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+    await stalled.close()
+  }
+
+  // A throwing onDial on a dial that succeeds: still listening, and the fault
+  // is reported on the next heartbeat rather than swallowed.
+  const ok = await wiredTransport()
+  try {
+    await ok.transport.start({
+      onDanmaku: () => {},
+      onDisconnect: () => {},
+      onDial: () => {
+        throw new Error('onDial-boom')
+      },
+    })
+    assert.equal(ok.transport.state().authenticated, true, 'a throwing onDial undid a dial that worked')
+    assert.equal(ok.transport.state().deferredErrors, 1)
+    assert.throws(() => ok.transport.heartbeat(), /onDial callback failed \(onDial-boom\)/)
+  } finally {
+    await ok.transport.stop().catch(() => {})
+    await ok.close()
+  }
+
+  // An async onDial that rejects: absorbed the same way, never an unhandled
+  // rejection (which on Node takes the process down).
+  const later = await wiredTransport()
+  try {
+    await later.transport.start({
+      onDanmaku: () => {},
+      onDisconnect: () => {},
+      onDial: async () => {
+        throw new Error('onDial-async-boom')
+      },
+    })
+    await until(() => later.transport.state().deferredErrors === 1, 'the rejected onDial to be deferred')
+    assert.equal(later.transport.state().authenticated, true)
+  } finally {
+    await later.transport.stop().catch(() => {})
+    await later.close()
   }
 })

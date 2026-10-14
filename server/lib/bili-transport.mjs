@@ -8,7 +8,8 @@
 // lease TTL, the visitor verdict and the "were we listening continuously since
 // the code was issued" arithmetic all live up there, and this file must not
 // know about any of them. What it owes that lifecycle is exactly three methods
-// (start / stop / heartbeat) and two callbacks (onDanmaku / onDisconnect), with
+// (start / stop / heartbeat) and three callbacks (onDanmaku / onDisconnect /
+// onDial — one record per dial, for the caller to log; see openSocket), with
 // one non-negotiable property: START MUST NOT RESOLVE UNTIL WE CAN HEAR THE
 // ROOM, and a socket that has gone away must be REPORTED rather than papered
 // over. The site has no OAuth to fall back on, so "we are deaf" and "the
@@ -545,6 +546,31 @@ export function decodeFrame(bytes, limits = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// the dial record's host
+
+const DEFAULT_PORTS = Object.freeze({ 'wss:': '443', 'ws:': '80', 'https:': '443', 'http:': '80' })
+
+/**
+ * 'hostname:port' of a wss_link — the dial record's `host`, and the one part of
+ * the URL that is both useful and safe in a log. Never the path or the query:
+ * the platform mints wss_link per session and nothing promises it never
+ * carries a token. A port the URL leaves implicit is written out, because the
+ * platform hands out both 443 and 2245 for the same hosts and `new URL()`
+ * drops ":443" from a wss URL — without this the two would log differently
+ * for no reason a reader could see.
+ */
+export function dialHost(url) {
+  let parsed
+  try {
+    parsed = new URL(url)
+  } catch {
+    return 'unparseable'
+  }
+  const port = parsed.port !== '' ? parsed.port : (DEFAULT_PORTS[parsed.protocol] ?? '')
+  return port === '' ? parsed.hostname : `${parsed.hostname}:${port}`
+}
+
+// ---------------------------------------------------------------------------
 // the transport
 
 /**
@@ -553,7 +579,11 @@ export function decodeFrame(bytes, limits = {}) {
  * The three methods are danmaku-source.mjs's transport contract, matched exactly
  * — read createDanmakuSource before changing any signature here:
  *
- *   start({ onDanmaku, onDisconnect })  resolves ONLY once the room is audible
+ *   start({ onDanmaku, onDisconnect, onDial })
+ *                                       resolves ONLY once the room is audible;
+ *                                       onDial is optional and gets one record
+ *                                       per dial, {host, phase, elapsedMs,
+ *                                       attempt, outcome} — see openSocket()
  *   stop()                              releases everything, both halves
  *   heartbeat()                         SYNCHRONOUS, may throw, never thenable
  *
@@ -902,15 +932,100 @@ export function createBiliTransport(config = {}) {
     deferredErrorCount += 1
   }
 
-  function openSocket(url, authBody) {
+  /**
+   * The caller's onDial, once per dial. Its failure is not the dial's: a throw,
+   * or a promise that rejects, is deferred to the next heartbeat like any other
+   * fault that has no caller to return to, and the dial's own result stands.
+   */
+  function reportDial(onDial, record) {
+    if (onDial === null) return
+    const fault = (err) =>
+      defer(new Error(`bili transport: the onDial callback failed (${errorText(err)})`, { cause: err }))
+    try {
+      const returned = onDial(record)
+      if (returned !== null && typeof returned === 'object' && typeof returned.then === 'function') {
+        returned.then(undefined, fault)
+      }
+    } catch (err) {
+      fault(err)
+    }
+  }
+
+  /**
+   * One dial: open the socket, send the auth packet, wait for AUTH_REPLY.
+   *
+   * EVERY DIAL ENDS IN EXACTLY ONE DIAL RECORD, success or failure. It goes to
+   * the `onDial` of the start() that made the dial, and on failure the thrown
+   * error carries the same frozen object as `err.dial`. Five keys, no more:
+   *
+   *   host       'hostname:port' of the wss_link (see dialHost) — never its
+   *              path or query, never the URL.
+   *   phase      'connecting' until the socket opens, then 'awaiting-auth-reply'
+   *              — set BEFORE the auth packet is sent, so a failed send reads
+   *              as the latter. A timeout in 'connecting' is a slow network; a
+   *              timeout in 'awaiting-auth-reply' is a server that let us in
+   *              and then said nothing, which is a different problem.
+   *   elapsedMs  dial start to dial end, on the injected clock.
+   *   attempt    consecutiveStartFailures + 1 at dial time: the count the
+   *              wss_link rotation indexes by, so attempt N dialled link
+   *              (N - 1) mod length. stop() does not reset it, so a dial right
+   *              after an earlier visitor's failures can start above 1.
+   *   outcome    'ok' — the only success — or 'timeout', 'auth-rejected',
+   *              'send-failed', 'socket-error', 'socket-closed', or 'cancelled'
+   *              when a stop() landed while the dial was still going.
+   *
+   * No auth_body, no game_id, no credential, no open_id: the record exists to
+   * be logged by the caller (this file writes nothing itself), so it carries
+   * only what is safe in a log line.
+   */
+  function openSocket(url, authBody, { attempt, onDial }) {
     const generation = socketGeneration + 1
     socketGeneration = generation
     authenticated = false
     dialCount += 1
+    const stopsAtDial = stopCount
+    const startedAtMs = clock.now().getTime()
+    const host = dialHost(url)
+    let phase = 'connecting'
 
     return new Promise((resolve, reject) => {
       let settled = false
-      const ws = new WebSocketImpl(url)
+      let connectTimer = null
+      let ws = null
+
+      function finish(err, outcome) {
+        if (settled) return
+        settled = true
+        if (connectTimer !== null) clock.clearTimeout(connectTimer)
+        const record = Object.freeze({
+          host,
+          phase,
+          elapsedMs: Math.max(0, clock.now().getTime() - startedAtMs),
+          attempt,
+          outcome: err && stopCount !== stopsAtDial ? 'cancelled' : outcome,
+        })
+        if (err) {
+          // Only while this dial's socket is still THE socket. A stop() that
+          // landed mid-dial has already closed it, and this connect timer
+          // keeps running after that; by the time it fires a later start may
+          // own `socket`, and closing it from here would deafen that start
+          // with its handlers nulled, i.e. silently.
+          if (ws !== null && socket === ws) closeSocket()
+          if (err !== null && typeof err === 'object' && Object.isExtensible(err)) err.dial = record
+        }
+        reportDial(onDial, record)
+        if (err) reject(err)
+        else resolve()
+      }
+
+      try {
+        ws = new WebSocketImpl(url)
+      } catch (err) {
+        // A wss_link the runtime will not even parse. Still a dial, still
+        // reported, and still the runtime's own error.
+        finish(err, 'socket-error')
+        return
+      }
       // Without this, undici hands binary messages over as a Blob and every
       // read below becomes async for no reason.
       ws.binaryType = 'arraybuffer'
@@ -924,41 +1039,29 @@ export function createBiliTransport(config = {}) {
       // at the only place it is made, and start() reads the mark rather than
       // matching this message. Every other way a dial fails — an auth
       // rejection, a send that threw, an error or close before auth — is
-      // created elsewhere without it and stays a hard failure.
-      const connectTimer = clock.setTimeout(() => {
+      // created elsewhere without it and stays a hard failure. The phase is in
+      // the message too, so it survives into any log that drops `err.dial`.
+      connectTimer = clock.setTimeout(() => {
         const timedOut = new OpenPlatformError(
-          `bili transport: the danmaku socket did not authenticate within ${opts.connectTimeoutMs}ms`,
+          `bili transport: the danmaku socket did not authenticate within ${opts.connectTimeoutMs}ms (phase: ${phase})`,
         )
         timedOut.connectTimeout = true
-        finish(timedOut)
+        finish(timedOut, 'timeout')
       }, opts.connectTimeoutMs)
-
-      function finish(err) {
-        if (settled) return
-        settled = true
-        clock.clearTimeout(connectTimer)
-        if (err) {
-          // Only while this dial's socket is still THE socket. A stop() that
-          // landed mid-dial has already closed it, and this connect timer
-          // keeps running after that; by the time it fires a later start may
-          // own `socket`, and closing it from here would deafen that start
-          // with its handlers nulled, i.e. silently.
-          if (socket === ws) closeSocket()
-          reject(err)
-        } else {
-          resolve()
-        }
-      }
 
       ws.onopen = () => {
         if (generation !== socketGeneration) return
+        phase = 'awaiting-auth-reply'
         try {
           // [BLIVEDM] open_live.py:293 — the auth body is sent VERBATIM as the
           // packet body. It is an opaque JSON string minted by /v2/app/start;
           // re-serialising it would change bytes the platform signed.
           ws.send(encodePacket({ operation: OPERATION.AUTH, body: authBody }))
         } catch (err) {
-          finish(new OpenPlatformError(`bili transport: could not send the auth packet (${errorText(err)})`))
+          finish(
+            new OpenPlatformError(`bili transport: could not send the auth packet (${errorText(err)})`),
+            'send-failed',
+          )
           return
         }
         armIdleWatchdog(generation)
@@ -994,6 +1097,7 @@ export function createBiliTransport(config = {}) {
                 new OpenPlatformError(
                   `bili transport: the danmaku server rejected our auth packet (code ${reply?.code ?? 'unknown'})`,
                 ),
+                'auth-rejected',
               )
               return
             }
@@ -1003,7 +1107,7 @@ export function createBiliTransport(config = {}) {
             // dueTime 0) and then on the interval.
             sendWsHeartbeat(generation)
             wsHeartbeatTimer = clock.setInterval(() => sendWsHeartbeat(generation), opts.wsHeartbeatIntervalMs)
-            finish(null)
+            finish(null, 'ok')
             continue
           }
           if (packet.operation === OPERATION.SEND_MSG_REPLY) {
@@ -1020,13 +1124,21 @@ export function createBiliTransport(config = {}) {
         // The event carries no useful detail in undici, and the close that
         // follows is where the truth is. Settle a start that is still waiting so
         // it does not sit out the connect timeout for a socket that is done.
-        if (!settled) finish(new OpenPlatformError('bili transport: the danmaku socket errored before authenticating'))
+        if (!settled) {
+          finish(
+            new OpenPlatformError('bili transport: the danmaku socket errored before authenticating'),
+            'socket-error',
+          )
+        }
       }
 
       ws.onclose = () => {
         if (generation !== socketGeneration) return
         if (!settled) {
-          finish(new OpenPlatformError('bili transport: the danmaku socket closed before authenticating'))
+          finish(
+            new OpenPlatformError('bili transport: the danmaku socket closed before authenticating'),
+            'socket-closed',
+          )
           return
         }
         goDeaf(generation, 'ws-closed')
@@ -1151,8 +1263,12 @@ export function createBiliTransport(config = {}) {
     return null
   }
 
-  async function start({ onDanmaku, onDisconnect } = {}) {
+  async function start({ onDanmaku, onDisconnect, onDial } = {}) {
     handlers = { onDanmaku: onDanmaku ?? null, onDisconnect: onDisconnect ?? null }
+    // Held by this call and handed to its dial, NOT kept in `handlers`: stop()
+    // nulls those, and a dial a stop overtakes still owes its record to the
+    // start that made it.
+    const reportTo = typeof onDial === 'function' ? onDial : null
     // Which stop() this start belongs to, and an identity for the session it
     // opens or takes over. A stop() that lands mid-start owns the teardown from
     // then on: see the failure path below.
@@ -1246,7 +1362,7 @@ export function createBiliTransport(config = {}) {
       // connect timeout has already counted itself, so the redial lands on the
       // NEXT address rather than the one that just stalled.
       const url = target.wssLinks[consecutiveStartFailures % target.wssLinks.length]
-      await openSocket(url, target.authBody)
+      await openSocket(url, target.authBody, { attempt: consecutiveStartFailures + 1, onDial: reportTo })
 
       consecutiveStartFailures = 0
       nextDialAllowedAtMs = 0
