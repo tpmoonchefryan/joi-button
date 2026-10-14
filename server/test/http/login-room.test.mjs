@@ -13,6 +13,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import Fastify from 'fastify'
+
+import { requestLogValue } from '../../app.mjs'
 import { LOGIN_STATES, dialLogFields } from '../../routes/public.mjs'
 import { VISITOR, boot, captureLog, cookieOf, get } from './harness.mjs'
 
@@ -261,9 +264,10 @@ test('cancelling gives the socket back even while the start is still in flight',
 // a production log line would carry.
 //
 // "Does not carry the poll token" is asserted of the dial lines and the final
-// warn only, never of every line captured: fastify's own request log records
-// GET /api/login/status?token=… with the token in the URL. That is older than
-// this change and outside it; asserting over everything would go red on it.
+// warn here, and of every line captured in the request-line cases at the end
+// of this section: since JOI-BUTTON-STORY-120 the request line keeps method and
+// path and drops the query string, so GET /api/login/status?token=… no longer
+// puts the token in the log. A new case may assert it over everything.
 
 const DIAL_KEYS = Object.freeze(['attempt', 'elapsedMs', 'host', 'outcome', 'phase'])
 // pino's numeric levels, which is what lands in the line.
@@ -398,4 +402,110 @@ test('a closed app writes no more dial lines: the dial subscription leaves with 
   await clock.advance(1)
   assert.equal(danmaku.control.startCount(), 2, 'the source never dialled again, so the silence proves nothing')
   assert.equal(logged(), 1, 'a closed app went on logging the source\'s dials')
+})
+
+// The request line itself (JOI-BUTTON-STORY-120). fastify writes one "incoming
+// request" line per request, and its default puts req.url in whole — for a
+// visitor's poll that is the poll token, once per poll. createApp hands fastify
+// requestLogValue as the `req` serializer instead: method and path, the query
+// string cut off, every other key as fastify writes it.
+
+test('a visitor\'s poll is logged as GET /api/login/status, and the poll token is on no line at all', async (t) => {
+  const log = captureLog()
+  const { app, clock } = await boot(t, { logger: log.logger })
+
+  const started = await app.inject({ method: 'POST', url: '/api/login/start' })
+  assert.equal(started.statusCode, 200, started.payload)
+  const cookie = cookieOf(started)
+  const { pollToken } = started.json()
+  assert.equal(typeof pollToken, 'string')
+  await clock.advance(1)
+
+  const polled = await get(app, `/api/login/status?token=${pollToken}`, { cookie })
+  assert.equal(polled.statusCode, 200, polled.payload)
+
+  const incoming = linesSaying(log, 'incoming request').filter((line) => line.req.method === 'GET')
+  assert.equal(incoming.length, 1, 'the poll did not write exactly one request line')
+  const [line] = incoming
+  assert.equal(line.level, INFO, 'the request line left the level production runs at')
+  assert.equal(line.req.url, '/api/login/status')
+
+  // Its pair is untouched: the same request, the same level, the same text.
+  const completed = linesSaying(log, 'request completed').filter((done) => done.reqId === line.reqId)
+  assert.equal(completed.length, 1, 'the poll\'s "request completed" line is missing, or its text has changed')
+  assert.equal(completed[0].level, INFO)
+  assert.equal(completed[0].res.statusCode, 200)
+
+  for (const [i, each] of log.lines.entries()) {
+    assert.ok(!JSON.stringify(each).includes(pollToken), `line ${i} ("${each.msg}") carries the visitor's poll token`)
+  }
+})
+
+test('every request line keeps method and path and loses the query string, whichever route it reached, or none', async (t) => {
+  const log = captureLog()
+  const { app } = await boot(t, { logger: log.logger })
+  const secret = 'secret-query-token'
+
+  await get(app, `/api/my/submissions?limit=5&token=${secret}`)
+  const nowhere = await get(app, `/api/no-such-route?x=1&token=${secret}`)
+  assert.equal(nowhere.statusCode, 404, nowhere.payload)
+
+  const incoming = linesSaying(log, 'incoming request')
+  assert.deepEqual(
+    incoming.map((line) => [line.level, line.req.method, line.req.url]),
+    [
+      [INFO, 'GET', '/api/my/submissions'],
+      [INFO, 'GET', '/api/no-such-route'],
+    ],
+  )
+  for (const [i, each] of log.lines.entries()) {
+    assert.ok(!JSON.stringify(each).includes(secret), `line ${i} ("${each.msg}") carries a query-string token`)
+  }
+
+  // Everything but the url is what fastify itself writes: the same request
+  // through a bare fastify, default serializer and all. That line does carry
+  // the token, which is the other half of the proof — without it, a fastify
+  // that had stopped logging query strings would let this case pass on its own.
+  const plain = captureLog()
+  const bare = Fastify({ logger: plain.logger })
+  t.after(() => bare.close())
+  await bare.inject({ method: 'GET', url: `/api/my/submissions?limit=5&token=${secret}` })
+  const [fastifyDefault] = linesSaying(plain, 'incoming request')
+  assert.ok(JSON.stringify(fastifyDefault.req).includes(secret), 'fastify\'s own request line no longer carries the query string')
+  assert.deepEqual(incoming[0].req, { ...fastifyDefault.req, url: '/api/my/submissions' })
+})
+
+test('requestLogValue is fastify\'s request value with the url cut at its first "?", and nothing else changed', () => {
+  assert.deepEqual(
+    requestLogValue({
+      method: 'GET',
+      url: '/api/login/status?token=secret-poll-token&next=?again',
+      headers: { 'accept-version': '2.x' },
+      host: 'api.joi.invalid',
+      ip: '127.0.0.1',
+      socket: { remotePort: 51234 },
+    }),
+    {
+      method: 'GET',
+      url: '/api/login/status',
+      version: '2.x',
+      host: 'api.joi.invalid',
+      remoteAddress: '127.0.0.1',
+      remotePort: 51234,
+    },
+  )
+
+  // No Accept-Version and no socket: undefined, so absent from the written
+  // line — as they are from fastify's own.
+  const written = JSON.parse(JSON.stringify(requestLogValue({
+    method: 'GET',
+    url: '/api/healthz',
+    headers: {},
+    host: 'api.joi.invalid',
+    ip: '127.0.0.1',
+  })))
+  assert.deepEqual(written, { method: 'GET', url: '/api/healthz', host: 'api.joi.invalid', remoteAddress: '127.0.0.1' })
+
+  // A url that is not a string is passed on as it came, as fastify's would be.
+  assert.equal(requestLogValue({ method: 'GET', headers: {} }).url, undefined)
 })

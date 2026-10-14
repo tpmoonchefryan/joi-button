@@ -99,6 +99,10 @@
 //     ruled 10-clip cap.
 //   * Return the fastify default body for a multipart refusal — the "the
 //     refusal names which rule was broken, and its number" case goes red.
+//   * Drop the `req` serializer resolveLogger adds, or let requestLogValue pass
+//     the url through whole — the "the poll token is on no line at all" and
+//     "every request line keeps method and path and loses the query string"
+//     cases go red.
 // ---------------------------------------------------------------------------
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
@@ -800,6 +804,20 @@ function requireSections(config, names) {
  *
  * Nothing at all means no logging, which is what a test wants; server.mjs always
  * passes something.
+ *
+ * Both OPTIONS paths leave here with requestLogValue as the `req` serializer,
+ * over any `req` serializer the caller brought (JOI-BUTTON-STORY-120). fastify's
+ * default writes req.url whole into the "incoming request" line, and a visitor
+ * polls GET /api/login/status?token=<pollToken> — one line per poll, each
+ * carrying a credential that answers for that visitor until it expires. The
+ * caller's object is copied, never edited: captureLog() hands the same options
+ * to more than one boot().
+ *
+ * An INSTANCE goes through untouched, and that is a gap stated rather than
+ * closed: fastify serialises requests on an instance with the instance's own
+ * `req` serializer, or with its default — the whole URL — when the instance has
+ * none. Nothing passes an instance today. Whatever starts to must build it with
+ * `serializers: { req: requestLogValue }`, or the poll token is back in the log.
  */
 function resolveLogger(logger, config) {
   if (logger === undefined || logger === null || logger === false) return {}
@@ -807,6 +825,35 @@ function resolveLogger(logger, config) {
   if (typeof logger === 'object' && methods.every((method) => typeof logger[method] === 'function')) {
     return { loggerInstance: logger }
   }
-  if (logger === true) return { logger: { level: config.server.logLevel } }
-  return { logger }
+  const options = logger === true ? { level: config.server.logLevel } : logger
+  return { logger: { ...options, serializers: { ...options.serializers, req: requestLogValue } } }
+}
+
+/**
+ * The `req` of every request log line: fastify's own default (asReqValue in
+ * fastify/lib/logger-pino.js), key for key, except that the url stops before
+ * its first '?' (JOI-BUTTON-STORY-120).
+ *
+ * Method and path are what a request line is read for. The query string is
+ * where callers of this API put what must not be kept — the visitor's poll
+ * token above all — so all of it goes, rather than a list of parameter names
+ * that is only ever as complete as the last route somebody remembered.
+ *
+ * The other keys are fastify's, so the line an operator searches keeps its
+ * shape: `version` is undefined, and so absent from the JSON, unless the
+ * request carried Accept-Version. A url that is not a string is returned as it
+ * is, which is what fastify's default would have written.
+ *
+ * Exported for the case that reads it directly, and for whatever builds a
+ * logger instance to hand to createApp (see resolveLogger).
+ */
+export function requestLogValue(req) {
+  return {
+    method: req.method,
+    url: typeof req.url === 'string' ? req.url.split('?', 1)[0] : req.url,
+    version: req.headers && req.headers['accept-version'],
+    host: req.host,
+    remoteAddress: req.ip,
+    remotePort: req.socket ? req.socket.remotePort : undefined,
+  }
 }
