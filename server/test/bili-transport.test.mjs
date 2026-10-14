@@ -2211,9 +2211,12 @@ test('stop() and the next start wait on an opening start only up to their bounds
       starts += 1
       if (starts > 1) return startAnswer(wssUrl, { gameId: `game-000${starts}` })
       await released
-      // Refused rather than answered with a session: a late answer that opened
-      // one is the residual path start() documents, and this case is about the
-      // bounds.
+      // Refused rather than answered with a session. This request went out
+      // before either bound began, so in production it answers or times out
+      // inside both, and a start a stop has overtaken no longer asks for a
+      // session after it (JOI-BUTTON-SUB-021): no answer can open one once a
+      // bound has run out. Here the held clock runs the bounds out while the
+      // request is still in time, and this case is about the bounds.
       return { status: 503, json: { code: -1, message: 'released by the test' } }
     },
     transport: { requestTimeoutMs: REQUEST_TIMEOUT_MS },
@@ -2273,6 +2276,207 @@ test('stop() and the next start wait on an opening start only up to their bounds
   } finally {
     release()
     await transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// a stop() that lands while a reconnect is ending the previous session
+// (JOI-BUTTON-SUB-021)
+//
+// The lifecycle reconnects by calling start() again without a stop(), and that
+// start first ends the session the dropped socket was on. A stop() that lands
+// while that end is in flight finds nothing to end — the start has already let
+// go of `session` — so it waits on the start instead. The start used to go on
+// to a /v2/app/start once the end had answered, and to an end for the session
+// that opened: two requests made after the stop, which could outlast both of
+// SUB-019's bounds. A deploy could exit with that end still in flight, and a
+// start that came after the stop could have its session taken over by the late
+// answer and left running for nobody.
+
+/**
+ * A gateway that holds the /v2/app/end for game-0001 until releaseEnd(); every
+ * other call is answered at once. The Nth /v2/app/start opens game-000N, N
+ * fixed when the request arrives.
+ */
+function firstSessionEndHeld() {
+  let releaseEnd
+  const held = new Promise((resolve) => {
+    releaseEnd = resolve
+  })
+  let starts = 0
+  return {
+    releaseEnd: () => releaseEnd(),
+    gatewayHandler: async (call, wssUrl) => {
+      if (call.path === OPEN_LIVE_PATHS.start) {
+        starts += 1
+        return startAnswer(wssUrl, { gameId: `game-000${starts}` })
+      }
+      if (call.path === OPEN_LIVE_PATHS.end && call.body?.game_id === 'game-0001') await held
+      return null
+    },
+  }
+}
+
+/** The gateway's calls so far, each end with the game_id it ended. */
+function callsSoFar(rig) {
+  return rig.gateway.calls.map((call) =>
+    call.path === OPEN_LIVE_PATHS.end ? `${call.path} ${call.body?.game_id}` : call.path,
+  )
+}
+
+/**
+ * Listening on game-0001, then dropped by the server: where a reconnect
+ * begins. The drop is reported, and the transport still holds the session —
+ * which is what gives the reconnect a session to end.
+ */
+async function listeningThenDropped(rig, disconnects) {
+  await rig.transport.start({
+    onDanmaku: () => {},
+    onDisconnect: (info) => disconnects.push({ from: 'first', ...info }),
+  })
+  rig.connections[0].drop()
+  await until(() => disconnects.length === 1, 'the drop to be reported')
+  assert.equal(rig.transport.state().hasSession, true, 'the drop let go of the session the reconnect is meant to end')
+}
+
+test('a stop() that lands while a reconnect is ending the previous session cancels the reconnect there: no new session, not counted, no backoff', async () => {
+  const gateway = firstSessionEndHeld()
+  const rig = await wiredTransport({ gatewayHandler: gateway.gatewayHandler })
+  const disconnects = []
+  try {
+    await listeningThenDropped(rig, disconnects)
+
+    // The reconnect, with no stop() first: it ends game-0001 itself, and the
+    // gateway holds that end.
+    const reconnect = rig.transport
+      .start({ onDanmaku: () => {}, onDisconnect: (info) => disconnects.push({ from: 'reconnect', ...info }) })
+      .then(
+        () => null,
+        (err) => err,
+      )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length === 1, "the reconnect's /v2/app/end")
+
+    let callsWhenStopSettled = null
+    const stopped = rig.transport.stop().then(() => {
+      callsWhenStopSettled = callsSoFar(rig)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(
+      callsWhenStopSettled,
+      null,
+      'stop() settled while the reconnect it overtook was still ending game-0001',
+    )
+
+    gateway.releaseEnd()
+    await stopped
+    // By the time stop() settles, and a deploy exits, nothing is left in
+    // flight: the reconnect asked for nothing after the stop.
+    assert.deepEqual(
+      callsWhenStopSettled,
+      [OPEN_LIVE_PATHS.start, `${OPEN_LIVE_PATHS.end} game-0001`],
+      'the reconnect the stop overtook went on to ask for a session after the stop',
+    )
+
+    const err = await reconnect
+    assert.ok(err instanceof OpenPlatformError, 'the reconnect the stop overtook went on as if someone still held it')
+    assert.match(err.message, /stopped while the previous app session was being ended/)
+    assert.match(err.message, /not dialling/)
+    assert.notEqual(err.retryable, true, 'a start nobody is waiting for asked to be retried')
+    assert.equal(err.retryAfterMs, undefined)
+    assert.deepEqual(callsSoFar(rig), [OPEN_LIVE_PATHS.start, `${OPEN_LIVE_PATHS.end} game-0001`])
+    const state = rig.transport.state()
+    // Cancelled, so it says nothing about the room: not counted, and no
+    // backoff for the next visitor to run into.
+    assert.equal(state.consecutiveStartFailures, 0, 'a reconnect the stop overtook was counted as a failure')
+    assert.equal(state.nextDialInMs, 0)
+    assert.equal(state.hasSession, false)
+    assert.equal(rig.connections.length, 1, 'the reconnect dialled after the stop')
+    assert.deepEqual(
+      disconnects.map((d) => d.from),
+      ['first'],
+      'a disconnect other than the first drop was reported',
+    )
+  } finally {
+    gateway.releaseEnd()
+    await rig.transport.stop().catch(() => {})
+    await rig.close()
+  }
+})
+
+test('a stop() that lands while a reconnect is ending the previous session, then a new start: only the new start opens a session, and it stays listening', async () => {
+  const gateway = firstSessionEndHeld()
+  const rig = await wiredTransport({ gatewayHandler: gateway.gatewayHandler })
+  const disconnects = []
+  const heard = []
+  try {
+    await listeningThenDropped(rig, disconnects)
+
+    let startsWhenReconnectSettled = null
+    const reconnect = rig.transport
+      .start({ onDanmaku: () => {}, onDisconnect: (info) => disconnects.push({ from: 'reconnect', ...info }) })
+      .then(
+        () => null,
+        (err) => {
+          startsWhenReconnectSettled = rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length
+          return err
+        },
+      )
+    await until(() => rig.gateway.callsTo(OPEN_LIVE_PATHS.end).length === 1, "the reconnect's /v2/app/end")
+
+    const stopped = rig.transport.stop()
+    const next = rig.transport.start({
+      onDanmaku: (d) => heard.push(d),
+      onDisconnect: (info) => disconnects.push({ from: 'next', ...info }),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.start).length,
+      1,
+      'the new start asked for a session while the reconnect it waits on was still ending game-0001',
+    )
+
+    gateway.releaseEnd()
+    await next
+    await stopped
+    assert.deepEqual(
+      callsSoFar(rig),
+      [OPEN_LIVE_PATHS.start, `${OPEN_LIVE_PATHS.end} game-0001`, OPEN_LIVE_PATHS.start],
+      'the reconnect the stop overtook asked for a session, and ended it, after the stop',
+    )
+    const err = await reconnect
+    assert.ok(err instanceof OpenPlatformError, 'the reconnect the stop overtook went on as if someone still held it')
+    assert.match(err.message, /stopped while the previous app session was being ended/)
+    assert.match(err.message, /not dialling/)
+    // Settled before anyone asked for a session: the new start asked only
+    // once the reconnect it waited on had settled.
+    assert.equal(startsWhenReconnectSettled, 1)
+
+    // A moment later the new start is still listening, on the one session it
+    // opened, and nothing but the first drop was reported.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(rig.connections.length, 2)
+    const state = rig.transport.state()
+    assert.equal(state.authenticated, true, "the new start's socket was closed under it")
+    assert.equal(state.hasSession, true, "the new start's session was taken from it")
+    assert.deepEqual(
+      disconnects.map((d) => d.from),
+      ['first'],
+      'a disconnect other than the first drop was reported',
+    )
+    rig.connections[1].send(danmakuPacket({ openId: 'open-next', uname: 'Next', msg: 'JOI-NEXT' }))
+    await until(() => heard.length === 1, "a danmaku on the new start's socket")
+
+    // And the session it holds is the only one still open: the stop that
+    // follows ends it, and every session the platform opened has been ended.
+    await rig.transport.stop()
+    assert.deepEqual(
+      rig.gateway.callsTo(OPEN_LIVE_PATHS.end).map((call) => call.body.game_id),
+      ['game-0001', 'game-0002'],
+    )
+  } finally {
+    gateway.releaseEnd()
+    await rig.transport.stop().catch(() => {})
     await rig.close()
   }
 })

@@ -157,6 +157,15 @@
 //     timer (30s in production) after it had already closed that dial's socket
 //     and ended its session itself. Drop the bound on either wait and the
 //     "only up to their bounds" case goes red.
+//   * Drop the stop check after the reconnect path's releaseAll() in start()
+//     — the two "a stop() that lands while a reconnect is ending the previous
+//     session" cases go red on the gateway's calls: the reconnect goes on to a
+//     /v2/app/start nobody is waiting for, and to an end for the session it
+//     opens. Both requests go out after the stop, so they can outlast both
+//     bounds above: a deploy can exit with that end still in flight, and when
+//     they are slow the late answer takes `session` over from the start that
+//     came after the stop and leaves its session running for nobody
+//     (JOI-BUTTON-SUB-021).
 //   * Make the backoff a constant instead of a doubling, or let a start dial
 //     while backing off — the backoff case goes red on the recorded delays and
 //     on the gateway's call count respectively.
@@ -1338,9 +1347,14 @@ export function createBiliTransport(config = {}) {
    * /v2/app/start went out before this start arrived, so its answer or its
    * request timeout lands inside the bound, and by then its clean-up has let go
    * of `session` and `socket` — releaseAll() does that before it awaits the
-   * /v2/app/end. The one path that can outlast the bound is a start the stop
-   * caught while it was still ending the previous session: that start sends
-   * its /v2/app/start only once the end has answered.
+   * /v2/app/end. A start the stop caught before its /v2/app/start went out
+   * asks for nothing more once the request it is waiting on has landed. On a
+   * reconnect that request is the end of the previous session, and that path
+   * checks for a stop right after the end (JOI-BUTTON-SUB-021). So both bounds
+   * hold on every path that opens a session: a start that stop() waits on has
+   * at most one answer and one end left, and a start that a new start waits on
+   * has let go of `session` and `socket` once the request it had in flight
+   * has landed.
    *
    * Through the lifecycle the wait only ever follows a stop(): it makes a new
    * start once the previous one has settled, or after stopping the transport
@@ -1450,6 +1464,20 @@ export function createBiliTransport(config = {}) {
       } catch (err) {
         defer(err)
       }
+      if (stopCount !== stopsAtEntry) {
+        // A stop() landed while that end was in flight. It found nothing to
+        // end — releaseAll() let go of `session` and `socket` before it
+        // awaited the end — and nobody is waiting for this start any more, so
+        // it ends here, before it has asked for anything. Thrown outside the
+        // try below: nothing to release, not counted, no backoff, never
+        // retryable. Going on would ask for a session nobody is waiting for,
+        // and that /v2/app/start and the end after it would outlast both of
+        // SUB-019's bounds — the stop() that waits on this start, and the
+        // start that arrives after that stop (JOI-BUTTON-SUB-021).
+        throw new OpenPlatformError(
+          'bili transport: stopped while the previous app session was being ended — not dialling',
+        )
+      }
     }
 
     try {
@@ -1457,17 +1485,17 @@ export function createBiliTransport(config = {}) {
       if (target === null) {
         target = await startGameSession(owner)
         if (stopCount !== stopsAtEntry) {
-          // A stop() landed before /v2/app/start answered — while it was
-          // answering, in practice (or, rarer, while the previous session was
-          // being ended above). Whatever session that stop found, it ended;
-          // the one this answer opened did not exist yet, so it is the one
-          // this start holds (startGameSession made it `session`, owned by
-          // `owner`), and nobody is waiting for it. Dialling it would listen
-          // on a session nobody holds until the platform reaps it for want of
-          // a project heartbeat, or until the next visitor's start ends it and
-          // walks into the 7001 cooldown. Thrown inside the try, so the
-          // failure path below ends it: stopped, so not counted, no backoff,
-          // never retryable, nothing kept.
+          // A stop() landed while /v2/app/start was answering; one that landed
+          // earlier is caught above, where it landed, before this start asked
+          // for anything. Whatever session that stop found, it ended; the one
+          // this answer opened did not exist yet, so it is the one this start
+          // holds (startGameSession made it `session`, owned by `owner`), and
+          // nobody is waiting for it. Dialling it would listen on a session
+          // nobody holds until the platform reaps it for want of a project
+          // heartbeat, or until the next visitor's start ends it and walks
+          // into the 7001 cooldown. Thrown inside the try, so the failure path
+          // below ends it: stopped, so not counted, no backoff, never
+          // retryable, nothing kept.
           throw new OpenPlatformError(
             'bili transport: stopped before /v2/app/start had answered — ending the new app session, not dialling',
           )
